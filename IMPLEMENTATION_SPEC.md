@@ -1,10 +1,10 @@
-# Cell-MSCA Implementation Specification (Stage 0)
+# Cell-MSCA Implementation Specification
 
-- Status: implementation baseline; no training authorized in this stage
-- Audit date: 2026-08-15 (Asia/Seoul)
-- Primary target: ACK 2026 fall submission
-- Scope: code and artifact audit, mathematical contract, implementation order
-- Existing source code was not modified. This document is the only new project file.
+- Status: Phases 1-3 complete; Phase 3.5 evidence audit integrated; Phase 4 architecture and synthetic validation authorized
+- Initial audit date: 2026-08-15 (Asia/Seoul)
+- Evidence-alignment date: 2026-08-23 (Asia/Seoul)
+- Intended paper venue, authorship, and citation metadata: human confirmation required
+- Scope: target and data contracts, leakage controls, model architecture, validation gates, and implementation order
 
 ## 1. Decision summary
 
@@ -18,7 +18,7 @@ The implementation order is fixed as follows:
 4. feature-token Cell-MSCA and architectural ablations;
 5. experiment runner, three-seed repetition, and paper tables.
 
-The current 36-month NPZ archive may be used as `v1_legacy` for code development and historical reproduction. It must not be presented as a corrected physical target until the ODIAC raster-to-grid operation and target unit are verified. A future `v2_corrected` dataset must use a documented mass-preserving or density-preserving raster operation chosen according to the verified source unit.
+The current 36-month NPZ archive may be used as **`v1_legacy ODIAC-derived zonal mean`** for code development and historical reproduction. It must not be presented as a confirmed `tC/cell/month` or `tCO2/cell/month` total until the ODIAC raster-to-grid operation, source release, and target unit are verified. A future `v2_corrected` dataset must use a documented mass-preserving or density-preserving raster operation chosen according to verified source metadata.
 
 ## 2. Evidence classes used in this specification
 
@@ -36,7 +36,7 @@ The following claims were checked directly in local files:
 
 ### 2.2 External or literature-based claims
 
-ODIAC's official unit, the conceptual interpretation of ODIAC, and comparisons with OpenCarbon and other studies come from the cited material in `MSCA_FINAL_RESEARCH_PLAN_KO.md`. They were not independently re-verified during this local Stage 0 audit. Before paper submission, each such claim must be linked to the exact ODIAC version README or primary paper.
+Phase 3.5 independently checked the important target, prior-work, feature-token, cross-attention, spatial-validation, transformation, loss, and metric claims against primary papers and official documentation. `REFERENCE_AUDIT.md`, `CLAIM_EVIDENCE_MATRIX.md`, and `references.bib` are the governing evidence record. Dataset-release claims still require the exact project source files and cannot be inferred from the current ODIAC website alone.
 
 ### 2.3 Unverified items
 
@@ -53,7 +53,7 @@ The following remain unverified even though reconstructed code now exists:
 
 ### 3.1 Current project
 
-The current project is a flat 11-file training/evaluation implementation:
+The repository preserves a flat 11-file 16x16 training/evaluation implementation as legacy code:
 
 - `src/model.py`
 - `src/spatial_grid_dataset.py`
@@ -67,7 +67,7 @@ The current project is a flat 11-file training/evaluation implementation:
 - `src/fast_data.py`
 - `src/make_figures.py`
 
-It has no `tests/` directory and is not currently a Git repository.
+The active single-cell implementation is isolated under `src/cell_msca/`, with synthetic unit and integration tests under `tests/`. The flat files above must remain byte-identical to the Phase 3 tag unless a separately approved legacy-maintenance task is opened.
 
 ### 3.2 Newly supplied project ZIP
 
@@ -92,8 +92,8 @@ Direct inspection of `2022_2024_npz.zip` confirmed:
 - `label_reg`: `[136, 130]`, `float32`;
 - `label_cls`: `[136, 130]`, `int64`, legacy metadata;
 - `mask`: `[136, 130]`, `uint8`;
-- Stream A order: `no2_mean`, `so2_mean`, `co_mean`;
-- Stream B order: `nightlight_mean`, `urban_fraction`, `power_plant_count`, `fossil_capacity_mw`;
+- Pollution/environment order: `no2_mean`, `so2_mean`, `co_mean`;
+- Socio-infrastructure order: `nightlight_mean`, `urban_fraction`, `power_plant_count`, `fossil_capacity_mw`;
 - the same mask in every month;
 - 17,157 valid cells per month and 617,652 cell-month samples;
 - no negative `label_reg` values;
@@ -139,7 +139,7 @@ The recovered preprocessing path is:
 
 ## 5. Normative target specification
 
-### 5.1 `v1_legacy` target
+### 5.1 `v1_legacy ODIAC-derived zonal mean` target
 
 Direct code evidence defines the current target as the arithmetic mean of ODIAC raster values selected by `all_touched=True`:
 
@@ -147,7 +147,7 @@ Direct code evidence defines the current target as the arithmetic mean of ODIAC 
 y^{legacy}_{g,t}=\frac{1}{|P(g)|}\sum_{p\in P(g)}E_{p,t}.
 \]
 
-This value must be described as an **ODIAC-derived zonal mean** unless the exact raster alignment and source unit demonstrate that it is also a valid target-cell monthly total. The `v1_legacy` metadata must therefore use a conservative unit string such as `ODIAC native value; exact target-cell interpretation unverified` until resolved.
+This value must be named **`v1_legacy ODIAC-derived zonal mean`**. It must not be interpreted as a confirmed target-cell monthly total. The exact ODIAC release is unresolved until the 36 source filenames, byte checksums, and source raster headers are recovered. The `v1_legacy` metadata must therefore use the conservative unit string `ODIAC native value; exact target-cell interpretation unverified` until resolved.
 
 ### 5.2 `v2_corrected` target candidate
 
@@ -157,7 +157,9 @@ If the source pixel stores a monthly total per source cell, a mass-preserving ta
 y_{g,t}=\sum_p E_{p,t}\frac{A(p\cap g)}{A(p)}.
 \]
 
-The implementation must validate an appropriate conservation identity over the covered region and handle clipped boundary cells explicitly. If the source raster instead stores a density, the correct aggregation is different; the exact ODIAC metadata decides which branch applies.
+The implementation must validate an appropriate conservation identity over the covered region and handle clipped boundary cells explicitly. If the source raster instead stores a density, the correct aggregation is different; the exact ODIAC metadata decides which branch applies. No `v2_corrected` data may be generated by guessing this branch.
+
+Every source and derived target manifest must record: the exact release identifier; all 36 filenames and SHA-256 checksums; CRS; affine transform; raster shape and resolution; spatial extent; nodata value and handling; temporal coverage; source variable name and unit; carbon-versus-CO2 convention; reprojection and resampling operation; target-grid geometry; boundary-cell policy; aggregation equation; and derived artifact checksum. Any tC-to-tCO2 conversion requires an explicit documented factor and may not be inferred from value magnitude.
 
 ### 5.3 Target transform
 
@@ -201,14 +203,16 @@ All evaluation and inference code must call one shared inverse-transform functio
 
 ### 6.1 Inputs
 
-For cell `g` and month `t`:
+For cell `g` and month `t`, the stream names and feature order are fixed:
 
 \[
-x^A_{g,t}=[NO_2,SO_2,CO]\in\mathbb{R}^{3},
+x^P_{g,t}=[NO_2,SO_2,CO]\in\mathbb{R}^{3}
+\quad\text{(pollution/environment)},
 \]
 
 \[
-x^B_{g,t}=[NTL,Urban,PlantCount,FossilCapacity]\in\mathbb{R}^{4}.
+x^I_{g,t}=[Nightlight,UrbanFraction,PowerPlantCount,FossilCapacity]\in\mathbb{R}^{4}
+\quad\text{(socio-infrastructure)}.
 \]
 
 Coordinates, grid IDs, neighbouring-cell values, and `label_cls` are not model inputs.
@@ -236,43 +240,47 @@ z_f^{(0)}=w_f\tilde x_f+b_f+e_f+e_{group(f)}.
 Thus
 
 \[
-Z_A\in\mathbb{R}^{3\times d},\qquad Z_B\in\mathbb{R}^{4\times d}.
+Z_P\in\mathbb{R}^{3\times d},\qquad Z_I\in\mathbb{R}^{4\times d}.
 \]
 
 Compressing each stream into one token before attention is forbidden because attention over a single key has a constant softmax weight of one.
 
 ### 6.4 Q, K, and V
 
-For the `B <- A` direction:
+The direction labels are experimental hypotheses, not domain truths. For the forward `I <- P` direction, Q is socio-infrastructure and K/V are pollution/environment:
 
 \[
-Q_B^h=LN(Z_B)W_Q^h,\quad K_A^h=LN(Z_A)W_K^h,\quad V_A^h=LN(Z_A)W_V^h,
+Q_I^h=LN(Z_I)W_Q^h,\quad K_P^h=LN(Z_P)W_K^h,\quad V_P^h=LN(Z_P)W_V^h,
 \]
 
 \[
-H_{B\leftarrow A}^h=softmax\left(\frac{Q_B^h(K_A^h)^T}{\sqrt{d_h}}\right)V_A^h.
+H_{I\leftarrow P}^h=softmax\left(\frac{Q_I^h(K_P^h)^T}{\sqrt{d_h}}\right)V_P^h.
 \]
 
 The attention matrix has shape `[batch, heads, 4, 3]`.
 
-For the `A <- B` direction, `Q=Z_A` and `K=V=Z_B`; its attention matrix has shape `[batch, heads, 3, 4]`.
+For the reverse `P <- I` direction, `Q=Z_P` and `K=V=Z_I`; its attention matrix has shape `[batch, heads, 3, 4]`.
 
-The current 16x16 model uses only `B <- A`, where Q is the 16 infrastructure spatial tokens and K/V are the 16 environmental spatial tokens. The source code justifies this as an attribution interpretation. It contains no evidence that Q was selected because coordinates are fixed. Coordinates are not passed to the current model. Attention direction is therefore an experimental design choice and must be tested through `B <- A`, `A <- B`, and bidirectional ablations.
+The current legacy 16x16 model uses only the analogous `I <- P` direction over spatial tokens. Neither project files nor literature establish that this direction is physically privileged. Forward, reverse, bidirectional, token/no-attention, and concat-MLP comparisons are mandatory, and attention weights must not be interpreted causally or as source attribution.
 
 ### 6.5 Fusion and head
 
-For each direction:
+The frozen Phase 4 implementation contract is pre-normalized residual processing. Each stream first applies feature-specific numerical tokenization, followed by the same number of independent pre-LayerNorm self-attention and feed-forward residual blocks and a final LayerNorm. A directional cross-attention block applies LayerNorm separately to query and context tokens, multi-head attention, a residual addition to the query stream, a pre-LayerNorm feed-forward residual, and final LayerNorm. All attention modules use batch-first tensors and operate independently within each sample; no operation may attend across the batch dimension.
+
+For each direction, the cross-attention residual is:
 
 \[
-\tilde Z_{B\leftarrow A}=LN\left(Z_B+Concat_h(H^h_{B\leftarrow A})W_O\right),
+U_I=Z_I+Dropout\left(Concat_h(H^h_{I\leftarrow P})W_O\right),
+\qquad
+\tilde Z_{I\leftarrow P}=LN\left(U_I+FFN(LN(U_I))\right),
 \]
 
-with the symmetric expression for `A <- B`.
+with the symmetric expression for `P <- I`.
 
 The bidirectional representation is
 
 \[
-h=Concat(MeanPool(\tilde Z_{B\leftarrow A}),MeanPool(\tilde Z_{A\leftarrow B})),
+h=Concat(MeanPool(\tilde Z_{I\leftarrow P}),MeanPool(\tilde Z_{P\leftarrow I})),
 \]
 
 followed by a scalar regression head. The one-way models pool only their updated query stream.
@@ -306,6 +314,8 @@ Optimizer, dropout, and weight decay remain tuned configuration values rather th
 - freeze model, loss, inverse mode, and hyperparameters before final test evaluation;
 - evaluate test once per pre-registered final seed/configuration;
 - do not select any option using test results.
+
+The paper's primary estimand remains unresolved. Median inverse naturally targets a conditional median on the transformed model scale, whereas Duan smearing is a mean-retransformation correction under its residual assumptions. Checkpoint selection for every log neural model uses median-inverse validation original-unit MAE; only after that checkpoint is fixed may median and train-residual-only Duan inverses be compared on validation data. The selected inverse is frozen before test access. This engineering rule does not itself resolve whether the paper's scientific estimand should be a conditional median, conditional mean, or regional total; that decision requires human confirmation and target-unit evidence.
 
 ### 7.3 Headline metrics
 
@@ -347,7 +357,9 @@ The current `train.py` uses one `args.seed` for both split assignment and model 
 
 A cell-fixed split prevents the same coordinate from crossing splits, but it does not remove correlation between neighbouring train and test cells. A buffered spatial block split is therefore a required robustness evaluation if feasible within the submission schedule. It is conceptually distinct from removing 16x16 input patches.
 
-The block split must be persisted, its actual train/validation/test/dropped cell counts recorded, and the minimum train-to-held-out distance verified. The current randomized block code is a useful prototype but has not yet been validated on the final 1x1 experiment protocol.
+The block and buffer distances must be selected from empirical spatial autocorrelation diagnostics rather than the legacy 16x16 patch size. The protocol must estimate target and predictor spatial dependence using training/development cells only, inspect variograms or correlograms and anisotropy, predefine candidate distances, test multiple block-grid origins, and report retained/dropped spatial coverage. Validation or test performance must not be used to choose the distance.
+
+The chosen block split must be persisted, its actual train/validation/test/dropped cell counts recorded, and all pairwise minimum Chebyshev distances verified. The existing `block_size=24`, `buffer_cells=16` split is a development feasibility artifact only; it is not a research-justified final robustness split.
 
 ### 8.3 Optional temporal holdout
 
@@ -362,49 +374,34 @@ The block split must be persisted, its actual train/validation/test/dropped cell
 3. log1p LightGBM;
 4. Tweedie LightGBM;
 5. Concat-MLP;
-6. two-stream no-cross-attention neural ablation;
-7. `B <- A` Cell-MSCA;
-8. `A <- B` Cell-MSCA;
+6. two-stream token encoder without cross-attention;
+7. forward `I <- P` Cell-MSCA;
+8. reverse `P <- I` Cell-MSCA;
 9. bidirectional Cell-MSCA.
 
 TabM or FT-Transformer is optional after the above set is complete. The architecture is justified only if its gain over LightGBM, Concat-MLP, and the no-attention ablation is larger than seed variation.
 
-### 9.2 Feature-group ablation
+### 9.2 Mandatory construction-overlap ablation
 
-- F1: NO2, SO2, CO;
-- F2: NTL, Urban, PlantCount, Capacity;
-- F3: all features except NTL, PlantCount, and Capacity;
-- F4: all seven features.
+- O0: all seven features;
+- O1: remove nightlight only;
+- O2: remove power-plant count and fossil capacity only;
+- O3: remove nightlight, power-plant count, and fossil capacity together.
 
-Run these on the selected model using the same split and evaluator. Record that NTL and power-plant information may overlap with ODIAC's inventory construction; ablation reduces but does not eliminate the limitation that ODIAC is not an independent field measurement.
+Run these on the selected model using the same split and evaluator. Nightlight directly overlaps ODIAC's documented non-point spatial disaggregation proxy; power-plant variables overlap conceptually with ODIAC point-source allocation, while exact source-dataset identity remains unresolved. These ablations are mandatory but cannot make ODIAC an independent field measurement.
 
 ## 10. Current code versus normative specification
 
-| Priority | Actual file evidence | Required state |
+| Status | Verified repository state | Remaining requirement |
 |---|---|---|
-| P0 | `raster_label.py` stores `zonal_stats(..., mean, all_touched=True)` | verify source unit/alignment; implement a scientifically matched v2 aggregation |
-| P0 | `evaluation.py` and `inference.py` multiply `expm1(pred)` by smearing | call the shared `exp(pred)*S-1` implementation |
-| P0 | `evaluation.py` bootstraps training-space arrays | bootstrap original and log spaces separately |
-| P0 | one seed controls split and model initialization | separate persistent `split_seed` and per-run `train_seed` |
-| P0 | result-time source differs from current source | archive result-time source as legacy and rerun every final result |
-| P0 | existing preprocessing code is not proven to be the actual NPZ generator | obtain execution provenance and source/intermediate checksums |
-| P1 | current dataset always returns 16x16 crops | add a true scalar-feature `CellDataset` |
-| P1 | current model creates 16 spatial tokens per stream | create 3 and 4 feature tokens without spatial patches |
-| P1 | current model implements only Q=Stream B, K/V=Stream A | add reverse and bidirectional variants |
-| P1 | D4 rotation/flip augmentation is enabled by default | remove it from the single-cell pipeline |
-| P1 | checkpoint selection uses log-space R2 or MAE | select on validation original-unit MAE |
-| P1 | scheduler contains three cosine cycles | replace with one documented cosine decay or a simpler fixed schedule |
-| P1 | baseline file has only one LightGBM path plus simple linear models | add raw, log1p, Tweedie, Concat-MLP, and shared evaluation |
-| P1 | preprocessing fills missing raster features using all cells in that month | fit statistical imputation on train cells for v2; document v1 leakage limitation |
-| P1 | `tensor_builder.py` requires `label_cls` | make classification metadata optional and irrelevant to model contracts |
-| P1 | current metrics and README emphasize top-10% hotspot recall | exclude hotspot outputs from paper-facing code and claims |
-| P1 | current `README.md` calls log R2 the primary accuracy metric | make original-unit metrics primary and label existing numbers legacy |
-| P1 | `README_preprocessing.md` says `label_reg_log` may be the tensor target | correct documentation: current NPZ contains raw `label_reg`; log1p occurs in the loader |
-| P1 | current loader clips negative target values before log1p | fail validation on negative targets |
-| P1 | current repository has no tests | add unit, integration, split, and smoke tests before full training |
-| P2 | checkpoint lacks data archive hash, exact feature-order contract, target unit, and data version | store all provenance fields in run metadata and checkpoint |
-| P2 | `pyproject.toml` lists one author while the paper is planned as co-first-author work | update project metadata only after both authors approve the public form |
-| P2 | final plan section 8.2 omits buffered spatial robustness | add block robustness to the experiment protocol or document a schedule-based omission |
+| Complete | shared target transform, median and Duan inverse, original/log metrics, and separate cell-cluster bootstrap under `src/cell_msca/` | retain prediction-file metric reproduction tests |
+| Complete | true one-cell `CellDataset`, fixed 3/4 feature order, persistent cell-fixed split, separated seeds, and train-only runtime preprocessing | rebuild raw pre-imputation features for a corrected data version |
+| Complete | train mean, raw/log1p/Tweedie LightGBM, Concat-MLP, shared evaluator, validation-only tuning, and frozen test gate | run real baselines only after data-provenance blockers are resolved |
+| Development only | persistent buffered-block feasibility path records ratios and minimum distances | replace development distance choices with the empirical autocorrelation protocol in section 8.2 |
+| Phase 4 | feature tokenizer, token/no-attention, forward, reverse, and bidirectional architectures | synthetic validation first; no project-data training in Phase 4.1 |
+| Blocked | legacy source tensors contain month-wide pre-split imputation | recover raw feature extracts and create a new immutable data version |
+| Blocked | exact source ODIAC files and headers are absent | recover the 36-file manifest and determine the correct v2 aggregation branch |
+| Human decision | public authorship, venue, citation metadata, target unit, and mean-versus-median estimand | record explicit approval; do not infer from legacy material |
 
 ## 11. Reusable code and code to isolate
 
@@ -514,9 +511,13 @@ Completion gates:
 - token shapes are `[B,3,d]` and `[B,4,d]`;
 - attention shapes are `[B,H,4,3]` and `[B,H,3,4]`;
 - each attention row sums to one within tolerance;
-- gradients reach feature projections, Q/K/V projections, and the regression head;
-- a tiny subset can be overfit, demonstrating that the implementation can learn;
-- parameter counts and forward shapes are logged for every variant.
+- gradients reach both feature streams, Q/K/V projections, and the regression head;
+- batch permutation and per-sample isolation tests demonstrate that attention never mixes samples;
+- deterministic CPU initialization and prediction are verified;
+- selected-model checkpoint save/reload produces identical predictions;
+- AdamW excludes bias and normalization parameters from weight decay;
+- parameter counts, unavoidable capacity differences, forward/backward shapes, device, runtime versions, configuration hash, split hash, data hash, preprocessing hash, and Git commit SHA are logged for every variant;
+- actual PyTorch forward, backward, and checkpoint smoke tests pass before Phase 4.1 is declared complete.
 
 ### Phase 5: final experiment
 
@@ -534,39 +535,30 @@ Completion gates:
 2. Which ODIAC release and exact 36 GeoTIFF files were used?
 3. Does the source raster value represent monthly total per source pixel or an areal density?
 4. For clipped Delhi boundary cells, will v2 report target-cell total or area-normalized density?
-5. Which inverse mode is primary for each loss? The choice must be frozen on validation.
-6. Is buffered block robustness mandatory for ACK, or a documented post-submission extension if time is insufficient?
-7. Should the legacy 16x16 result appear in an appendix or be omitted entirely?
+5. Is the paper's primary estimand a conditional median, conditional mean, or a regional total? Validation may select an inverse mode for a fixed checkpoint but cannot answer the scientific estimand question by itself.
+6. What empirical spatial autocorrelation range and anisotropy justify the final block and buffer candidates?
+7. Is buffered block robustness mandatory for the intended submission, or a documented later extension if infeasible?
+8. Should the legacy 16x16 result appear in a clearly separated historical appendix or be omitted entirely?
+9. What authorship order, affiliations, paper title, venue, and citation metadata have all contributors approved?
 
-## 15. First authorized code-change stage
+## 15. Current authorized code-change stage
 
-The first code change must be **Phase 1 only**:
+Phases 1-3 are complete and protected by the Phase 3 baseline tag. Phase 4.0 aligns repository claims with the Phase 3.5 audit. Phase 4.1 may add only the single-cell feature tokenizer, token/no-attention and directional architecture variants, reusable neural runtime/checkpoint utilities, and synthetic tests.
 
-- create the new `cell_msca.target` and `cell_msca.metrics` modules;
-- implement one shared inverse-transform path;
-- implement separate original/log bootstrap outputs;
-- add regression tests for the known smearing error;
-- add prediction-to-metric round-trip tests;
-- do not change the dataset, model, split, or training code in that commit.
+Phase 4.1 must not run full `v1_legacy` training, open the test gate, create paper-facing performance results, reconstruct source rasters by assumption, generate `v2_corrected` data, alter persistent split artifacts, or modify the flat legacy `src/*.py` files.
 
-This isolates evaluation correctness before any new model result is generated.
+## 16. Verified implementation and research boundary
 
-## 16. Validation report for Stage 0
+### Confirmed implementation facts
 
-### Confirmed facts
+- Phase 1 shared inverse, metrics, bootstrap, and prediction round-trip contracts are tested;
+- Phase 2 single-cell data, feature metadata, persistent splits, separated seeds, and preprocessing provenance contracts are tested;
+- Phase 3 baseline selection uses validation only, computes Duan from train residuals only, and keeps the test subset behind a frozen-selection gate;
+- the current NPZ archive contains three pollution/environment and four socio-infrastructure channels, raw `label_reg`, and a stable mask according to the recovered project artifacts;
+- the recovered preprocessing code computes the legacy target with zonal mean and `all_touched=True` and fills some missing features before splitting;
+- flat legacy source and result-time source are not fully identical, so historical results cannot be assigned to the active package;
+- Phase 3.5 documents the literature evidence, project evidence, hypotheses, and unresolved claims.
 
-- the current NPZ archive has the expected 36 months, seven feature channels, raw `label_reg`, and stable mask;
-- the recovered preprocessing code computes `label_reg` using zonal mean with `all_touched=True`;
-- `label_reg_log` is created in CSV preprocessing but is not stored in the NPZ;
-- the current model uses Q from Stream B and K/V from Stream A over 16 spatial tokens;
-- the current split can keep a cell fixed across months and has a buffered-block prototype;
-- train-only normalization is implemented in the current training path;
-- missing-value filling in the recovered preprocessing occurs before splitting and can include held-out cells;
-- existing evaluation/inference use an inconsistent smearing inverse;
-- existing bootstrap confidence intervals are training-space intervals;
-- current and result-time source code are not identical;
-- the current project has no tests and no Git history.
+### Research boundary before project-data training
 
-### First verification after coding begins
-
-Run only unit tests and small synthetic integration tests. Do not train on the 36-month data until Phase 1 and Phase 2 gates pass and a persistent split checksum exists.
+Only unit tests, synthetic integration tests, architecture parameter accounting, and isolated runtime smoke tests are authorized. Project-data training remains blocked by target provenance, physical aggregation, upstream imputation, estimand, and spatial-protocol decisions. The test split remains closed until the data version, split, preprocessing, configuration, selected checkpoint, inverse mode, and seeds are frozen under a reviewed protocol.

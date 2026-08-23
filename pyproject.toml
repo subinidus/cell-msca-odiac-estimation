@@ -1,11 +1,10 @@
 [project]
 name = "msca-carbon"
 version = "1.0.0"
-description = "MS-CA: Continuous carbon-emission prediction from satellite proxies via a multi-stream cross-attention Vision Transformer, under leakage-controlled evaluation."
+description = "Single-cell estimation of an ODIAC-referenced inventory proxy under leakage-controlled evaluation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Subin Seo" }]
 
 [tool.ruff]
 line-length = 99
