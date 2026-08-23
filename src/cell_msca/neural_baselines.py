@@ -1,0 +1,331 @@
+"""Lazy-PyTorch neural baseline and reusable log-target trainer for Phase 3."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
+
+import numpy as np
+from numpy.typing import NDArray
+
+from .baselines import (
+    BaselinePredictions,
+    LogInverseSelection,
+    ModelContract,
+    TuningData,
+    _validated_feature_count,
+    select_log_inverse_on_validation,
+)
+from .data import STREAM_A_FEATURES, STREAM_B_FEATURES, canonical_sha256
+from .metrics import regression_metrics
+from .target import inverse_target
+
+NeuralLoss = Literal["log_l1", "log_huber"]
+NeuralModelFactory = Callable[[Any, int, Any], Any]
+
+
+class LogNeuralTrainingConfig(Protocol):
+    learning_rate: float
+    batch_size: int
+    max_epochs: int
+    patience: int
+    min_delta: float
+    weight_decay: float
+    loss: NeuralLoss
+    huber_delta: float
+
+
+@dataclass(frozen=True)
+class ConcatMLPConfig:
+    model_name: str = "concat_mlp"
+    hidden_sizes: tuple[int, ...] = (32, 16)
+    dropout: float = 0.1
+    loss: NeuralLoss = "log_huber"
+    huber_delta: float = 1.0
+    learning_rate: float = 1e-3
+    batch_size: int = 256
+    max_epochs: int = 200
+    patience: int = 20
+    min_delta: float = 0.0
+    weight_decay: float = 1e-5
+
+    def __post_init__(self) -> None:
+        if self.model_name != "concat_mlp":
+            raise ValueError("Concat-MLP model_name must be 'concat_mlp'")
+        hidden_sizes = tuple(int(size) for size in self.hidden_sizes)
+        object.__setattr__(self, "hidden_sizes", hidden_sizes)
+        if not hidden_sizes or any(size <= 0 for size in hidden_sizes):
+            raise ValueError("hidden_sizes must contain positive integers")
+        if self.loss not in {"log_l1", "log_huber"}:
+            raise ValueError("Concat-MLP loss must be 'log_l1' or 'log_huber'")
+        if not np.isfinite(self.huber_delta) or self.huber_delta <= 0.0:
+            raise ValueError("huber_delta must be finite and positive")
+        if not np.isfinite(self.dropout) or not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if not np.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be finite and positive")
+        if self.batch_size <= 0 or self.max_epochs <= 0 or self.patience <= 0:
+            raise ValueError("batch_size, max_epochs, and patience must be positive")
+        if not np.isfinite(self.min_delta) or self.min_delta < 0.0:
+            raise ValueError("min_delta must be finite and non-negative")
+        if not np.isfinite(self.weight_decay) or self.weight_decay < 0.0:
+            raise ValueError("weight_decay must be finite and non-negative")
+
+    def to_dict(self, *, train_seed: int, target_scale: float) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "hidden_sizes": list(self.hidden_sizes),
+            "dropout": self.dropout,
+            "loss": self.loss,
+            "huber_delta": self.huber_delta,
+            "learning_rate": self.learning_rate,
+            "batch_size": self.batch_size,
+            "max_epochs": self.max_epochs,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "weight_decay": self.weight_decay,
+            "optimizer": "AdamW",
+            "weight_decay_scope": "weights_only_no_bias",
+            "checkpoint_metric": "median_inverse_validation_original_unit_mae",
+            "train_seed": train_seed,
+            "target_transform": "log1p",
+            "target_scale": target_scale,
+        }
+
+
+@dataclass(frozen=True)
+class NeuralTrainingResult:
+    model: Any
+    best_epoch: int
+    inverse_selection: LogInverseSelection
+
+
+@dataclass(frozen=True)
+class FittedConcatMLP:
+    model: Any
+    contract: ModelContract
+
+    def predict(self, features: NDArray[np.float64]) -> BaselinePredictions:
+        _validated_feature_count(features)
+        torch = _require_torch()
+        pred_log = _predict_log(
+            torch,
+            self.model,
+            np.asarray(features, dtype=np.float64),
+        )
+        pred_original = inverse_target(
+            pred_log,
+            scale=self.contract.target_scale,
+            mode=self.contract.inverse_mode,
+            smearing_factor=self.contract.smearing_factor,
+        )
+        return BaselinePredictions(pred_original, pred_log)
+
+
+def fit_concat_mlp(
+    data: TuningData,
+    config: ConcatMLPConfig | None = None,
+) -> FittedConcatMLP:
+    """Build a seven-feature MLP and train through the reusable neural trainer."""
+
+    config = config or ConcatMLPConfig()
+    training = fit_log_neural_model(
+        data,
+        config,
+        model_factory=_build_concat_mlp,
+    )
+    config_sha256 = canonical_sha256(
+        config.to_dict(
+            train_seed=data.provenance.train_seed,
+            target_scale=data.provenance.target_scale,
+        )
+    )
+    return FittedConcatMLP(
+        model=training.model,
+        contract=ModelContract(
+            model_name=config.model_name,
+            config_sha256=config_sha256,
+            target_transform="log1p",
+            target_scale=data.provenance.target_scale,
+            loss_objective=f"{config.loss}_on_log1p_target",
+            inverse_mode=training.inverse_selection.inverse_mode,
+            smearing_factor=training.inverse_selection.smearing_factor,
+            best_epoch=training.best_epoch,
+        ),
+    )
+
+
+def fit_log_neural_model(
+    data: TuningData,
+    config: LogNeuralTrainingConfig,
+    *,
+    model_factory: NeuralModelFactory,
+) -> NeuralTrainingResult:
+    """Train a log-target neural model with a validation-only checkpoint.
+
+    Cell-MSCA can reuse this trainer by supplying its own model factory. During
+    training, checkpoint selection always uses median inverse validation MAE.
+    Duan is calculated from train residuals and compared only after the selected
+    checkpoint has been restored.
+    """
+
+    torch = _require_torch()
+    train_seed = data.provenance.train_seed
+    torch.manual_seed(train_seed)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(train_seed)
+    input_size = len(STREAM_A_FEATURES) + len(STREAM_B_FEATURES)
+    model = model_factory(torch, input_size, config)
+    optimizer = torch.optim.AdamW(
+        _adamw_parameter_groups(model, weight_decay=config.weight_decay),
+        lr=config.learning_rate,
+    )
+    train_features = torch.as_tensor(data.train.features, dtype=torch.float32)
+    train_target = torch.as_tensor(data.train.target_log, dtype=torch.float32)
+
+    best_state = copy.deepcopy(model.state_dict())
+    best_epoch = 0
+    best_validation_mae = float("inf")
+    epochs_without_improvement = 0
+    for epoch in range(1, config.max_epochs + 1):
+        model.train()
+        order = torch.randperm(data.train.n_samples, generator=generator)
+        for start in range(0, data.train.n_samples, config.batch_size):
+            batch_indices = order[start : start + config.batch_size]
+            prediction = model(train_features[batch_indices]).reshape(-1)
+            target = train_target[batch_indices]
+            loss = _log_loss(torch, prediction, target, config)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        validation_pred_log = _predict_log(
+            torch,
+            model,
+            data.validation.features,
+        )
+        validation_mae = _median_inverse_validation_mae(
+            validation_true_original=data.validation.target_original,
+            validation_pred_log=validation_pred_log,
+            target_scale=data.provenance.target_scale,
+        )
+        if validation_mae < best_validation_mae - config.min_delta:
+            best_validation_mae = validation_mae
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= config.patience:
+                break
+
+    if best_epoch == 0:
+        raise RuntimeError("neural training produced no valid validation checkpoint")
+    model.load_state_dict(best_state)
+    model.eval()
+    train_pred_log = _predict_log(torch, model, data.train.features)
+    validation_pred_log = _predict_log(torch, model, data.validation.features)
+    inverse_selection = select_log_inverse_on_validation(
+        train_true_log=data.train.target_log,
+        train_pred_log=train_pred_log,
+        validation_true_original=data.validation.target_original,
+        validation_pred_log=validation_pred_log,
+        target_scale=data.provenance.target_scale,
+    )
+    return NeuralTrainingResult(model, best_epoch, inverse_selection)
+
+
+def _require_torch() -> Any:
+    try:
+        return importlib.import_module("torch")
+    except (ImportError, OSError) as error:
+        raise ImportError(
+            "Concat-MLP requires the optional 'torch' package; install PyTorch "
+            "in the execution environment before neural baseline training"
+        ) from error
+
+
+def _build_concat_mlp(torch: Any, input_size: int, config: Any) -> Any:
+    layers: list[Any] = []
+    previous_size = input_size
+    for hidden_size in config.hidden_sizes:
+        layers.append(torch.nn.Linear(previous_size, hidden_size))
+        layers.append(torch.nn.ReLU())
+        if config.dropout > 0.0:
+            layers.append(torch.nn.Dropout(p=config.dropout))
+        previous_size = hidden_size
+    layers.append(torch.nn.Linear(previous_size, 1))
+    return torch.nn.Sequential(*layers)
+
+
+def _adamw_parameter_groups(
+    model: Any,
+    *,
+    weight_decay: float,
+) -> list[dict[str, Any]]:
+    weights: list[Any] = []
+    biases: list[Any] = []
+    for name, parameter in model.named_parameters():
+        if not getattr(parameter, "requires_grad", True):
+            continue
+        if name.endswith(".bias"):
+            biases.append(parameter)
+        else:
+            weights.append(parameter)
+    if not weights:
+        raise ValueError("neural model has no trainable weight parameters")
+    groups = [{"params": weights, "weight_decay": float(weight_decay)}]
+    if biases:
+        groups.append({"params": biases, "weight_decay": 0.0})
+    return groups
+
+
+def _log_loss(
+    torch: Any,
+    prediction: Any,
+    target: Any,
+    config: LogNeuralTrainingConfig,
+) -> Any:
+    if config.loss == "log_l1":
+        return torch.nn.functional.l1_loss(prediction, target)
+    if config.loss == "log_huber":
+        return torch.nn.functional.huber_loss(
+            prediction,
+            target,
+            delta=config.huber_delta,
+        )
+    raise ValueError("neural loss must be 'log_l1' or 'log_huber'")
+
+
+def _predict_log(
+    torch: Any,
+    model: Any,
+    features: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    model.eval()
+    with torch.no_grad():
+        tensor = torch.as_tensor(features, dtype=torch.float32)
+        prediction = model(tensor).reshape(-1).detach().cpu().numpy()
+    values = np.asarray(prediction, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("neural model produced non-finite log predictions")
+    return values
+
+
+def _median_inverse_validation_mae(
+    *,
+    validation_true_original: NDArray[np.float64],
+    validation_pred_log: NDArray[np.float64],
+    target_scale: float,
+) -> float:
+    pred_original = inverse_target(
+        validation_pred_log,
+        scale=target_scale,
+        mode="median",
+    )
+    return float(
+        regression_metrics(validation_true_original, pred_original)["mae"]
+    )

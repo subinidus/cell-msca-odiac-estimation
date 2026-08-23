@@ -1,0 +1,63 @@
+{
+  "schema_version": "cell_msca.baseline_experiment.v1",
+  "stage": "validation_tuning",
+  "project_root": "..",
+  "data": {
+    "npz_glob": "data/v1_legacy/*.npz",
+    "target_scale": 1.0,
+    "legacy_data_version": "v1_legacy",
+    "legacy_target_unit": "ODIAC native value; exact target-cell interpretation unverified"
+  },
+  "split_csv": "splits/cell_fixed_seed42.csv",
+  "split_metadata_json": "splits/cell_fixed_seed42.metadata.v2.json",
+  "output_dir": "outputs/phase3_baselines/example_validation",
+  "split": {
+    "split_seed": 42,
+    "validation_ratio": 0.15,
+    "test_ratio": 0.15
+  },
+  "train_seed": 42,
+  "models": {
+    "train_mean": [
+      {}
+    ],
+    "lightgbm_raw": [
+      {
+        "n_estimators": 1000,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "early_stopping_rounds": 50
+      }
+    ],
+    "lightgbm_log1p": [
+      {
+        "n_estimators": 1000,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "early_stopping_rounds": 50
+      }
+    ],
+    "lightgbm_tweedie": [
+      {
+        "n_estimators": 1000,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "early_stopping_rounds": 50,
+        "tweedie_variance_power": 1.5
+      }
+    ],
+    "concat_mlp": [
+      {
+        "hidden_sizes": [32, 16],
+        "dropout": 0.1,
+        "loss": "log_huber",
+        "huber_delta": 1.0,
+        "learning_rate": 0.001,
+        "batch_size": 256,
+        "max_epochs": 200,
+        "patience": 20,
+        "weight_decay": 0.00001
+      }
+    ]
+  }
+}
