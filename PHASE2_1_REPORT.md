@@ -1,6 +1,6 @@
 # Phase 2.1 Review and Hardening Report
 
-- 완료일: 2026-08-22 (Asia/Seoul)
+- 완료일: 2026-08-18 (Asia/Seoul)
 - 범위: persistent split 및 preprocessing provenance 계약 보강
 - 모델/baseline 구현: 없음
 - 학습 실행: 없음
