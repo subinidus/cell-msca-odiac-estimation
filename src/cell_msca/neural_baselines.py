@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import random
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -25,6 +26,7 @@ from .target import inverse_target
 
 NeuralLoss = Literal["log_l1", "log_huber"]
 NeuralModelFactory = Callable[[Any, int, Any], Any]
+NeuralForward = Callable[[Any, Any], Any]
 
 
 class LogNeuralTrainingConfig(Protocol):
@@ -36,6 +38,7 @@ class LogNeuralTrainingConfig(Protocol):
     weight_decay: float
     loss: NeuralLoss
     huber_delta: float
+    device: str
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,7 @@ class ConcatMLPConfig:
     patience: int = 20
     min_delta: float = 0.0
     weight_decay: float = 1e-5
+    device: str = "cpu"
 
     def __post_init__(self) -> None:
         if self.model_name != "concat_mlp":
@@ -73,6 +77,8 @@ class ConcatMLPConfig:
             raise ValueError("min_delta must be finite and non-negative")
         if not np.isfinite(self.weight_decay) or self.weight_decay < 0.0:
             raise ValueError("weight_decay must be finite and non-negative")
+        if self.device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("device must be 'cpu', 'cuda', or 'auto'")
 
     def to_dict(self, *, train_seed: int, target_scale: float) -> dict[str, Any]:
         return {
@@ -88,7 +94,9 @@ class ConcatMLPConfig:
             "min_delta": self.min_delta,
             "weight_decay": self.weight_decay,
             "optimizer": "AdamW",
-            "weight_decay_scope": "weights_only_no_bias",
+            "weight_decay_scope": "weights_only_no_bias_or_normalization",
+            "device": self.device,
+            "deterministic_algorithms": True,
             "checkpoint_metric": "median_inverse_validation_original_unit_mae",
             "train_seed": train_seed,
             "target_transform": "log1p",
@@ -101,6 +109,7 @@ class NeuralTrainingResult:
     model: Any
     best_epoch: int
     inverse_selection: LogInverseSelection
+    device: str
 
 
 @dataclass(frozen=True)
@@ -163,6 +172,7 @@ def fit_log_neural_model(
     config: LogNeuralTrainingConfig,
     *,
     model_factory: NeuralModelFactory,
+    forward_batch: NeuralForward | None = None,
 ) -> NeuralTrainingResult:
     """Train a log-target neural model with a validation-only checkpoint.
 
@@ -174,17 +184,27 @@ def fit_log_neural_model(
 
     torch = _require_torch()
     train_seed = data.provenance.train_seed
-    torch.manual_seed(train_seed)
+    _set_deterministic_seed(torch, train_seed)
+    device = _resolve_torch_device(torch, config.device)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(train_seed)
     input_size = len(STREAM_A_FEATURES) + len(STREAM_B_FEATURES)
-    model = model_factory(torch, input_size, config)
+    model = model_factory(torch, input_size, config).to(device)
+    run_forward = forward_batch or _default_forward
     optimizer = torch.optim.AdamW(
         _adamw_parameter_groups(model, weight_decay=config.weight_decay),
         lr=config.learning_rate,
     )
-    train_features = torch.as_tensor(data.train.features, dtype=torch.float32)
-    train_target = torch.as_tensor(data.train.target_log, dtype=torch.float32)
+    train_features = torch.as_tensor(
+        data.train.features,
+        dtype=torch.float32,
+        device=device,
+    )
+    train_target = torch.as_tensor(
+        data.train.target_log,
+        dtype=torch.float32,
+        device=device,
+    )
 
     best_state = copy.deepcopy(model.state_dict())
     best_epoch = 0
@@ -195,8 +215,12 @@ def fit_log_neural_model(
         order = torch.randperm(data.train.n_samples, generator=generator)
         for start in range(0, data.train.n_samples, config.batch_size):
             batch_indices = order[start : start + config.batch_size]
-            prediction = model(train_features[batch_indices]).reshape(-1)
-            target = train_target[batch_indices]
+            device_indices = batch_indices.to(device)
+            prediction = run_forward(
+                model,
+                train_features[device_indices],
+            ).reshape(-1)
+            target = train_target[device_indices]
             loss = _log_loss(torch, prediction, target, config)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -206,6 +230,8 @@ def fit_log_neural_model(
             torch,
             model,
             data.validation.features,
+            device=device,
+            forward_batch=run_forward,
         )
         validation_mae = _median_inverse_validation_mae(
             validation_true_original=data.validation.target_original,
@@ -226,8 +252,20 @@ def fit_log_neural_model(
         raise RuntimeError("neural training produced no valid validation checkpoint")
     model.load_state_dict(best_state)
     model.eval()
-    train_pred_log = _predict_log(torch, model, data.train.features)
-    validation_pred_log = _predict_log(torch, model, data.validation.features)
+    train_pred_log = _predict_log(
+        torch,
+        model,
+        data.train.features,
+        device=device,
+        forward_batch=run_forward,
+    )
+    validation_pred_log = _predict_log(
+        torch,
+        model,
+        data.validation.features,
+        device=device,
+        forward_batch=run_forward,
+    )
     inverse_selection = select_log_inverse_on_validation(
         train_true_log=data.train.target_log,
         train_pred_log=train_pred_log,
@@ -235,7 +273,7 @@ def fit_log_neural_model(
         validation_pred_log=validation_pred_log,
         target_scale=data.provenance.target_scale,
     )
-    return NeuralTrainingResult(model, best_epoch, inverse_selection)
+    return NeuralTrainingResult(model, best_epoch, inverse_selection, str(device))
 
 
 def _require_torch() -> Any:
@@ -243,8 +281,8 @@ def _require_torch() -> Any:
         return importlib.import_module("torch")
     except (ImportError, OSError) as error:
         raise ImportError(
-            "Concat-MLP requires the optional 'torch' package; install PyTorch "
-            "in the execution environment before neural baseline training"
+            "neural baselines and Cell-MSCA require the optional 'torch' package; "
+            "install PyTorch in an isolated execution environment before training"
         ) from error
 
 
@@ -267,19 +305,27 @@ def _adamw_parameter_groups(
     weight_decay: float,
 ) -> list[dict[str, Any]]:
     weights: list[Any] = []
-    biases: list[Any] = []
+    no_decay: list[Any] = []
     for name, parameter in model.named_parameters():
         if not getattr(parameter, "requires_grad", True):
             continue
-        if name.endswith(".bias"):
-            biases.append(parameter)
+        parameter_ndim = getattr(parameter, "ndim", None)
+        is_bias = name == "bias" or name.endswith(".bias")
+        is_normalization = (
+            parameter_ndim == 1
+            or ".norm." in name
+            or name.startswith("norm.")
+            or "layernorm" in name.lower()
+        )
+        if is_bias or is_normalization:
+            no_decay.append(parameter)
         else:
             weights.append(parameter)
     if not weights:
         raise ValueError("neural model has no trainable weight parameters")
     groups = [{"params": weights, "weight_decay": float(weight_decay)}]
-    if biases:
-        groups.append({"params": biases, "weight_decay": 0.0})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
     return groups
 
 
@@ -304,15 +350,59 @@ def _predict_log(
     torch: Any,
     model: Any,
     features: NDArray[np.float64],
+    *,
+    device: Any | None = None,
+    forward_batch: NeuralForward | None = None,
 ) -> NDArray[np.float64]:
     model.eval()
+    resolved_device = device or _model_device(torch, model)
+    run_forward = forward_batch or _default_forward
     with torch.no_grad():
-        tensor = torch.as_tensor(features, dtype=torch.float32)
-        prediction = model(tensor).reshape(-1).detach().cpu().numpy()
+        tensor = torch.as_tensor(
+            features,
+            dtype=torch.float32,
+            device=resolved_device,
+        )
+        prediction = run_forward(model, tensor).reshape(-1).detach().cpu().numpy()
     values = np.asarray(prediction, dtype=np.float64)
     if not np.all(np.isfinite(values)):
         raise ValueError("neural model produced non-finite log predictions")
     return values
+
+
+def _default_forward(model: Any, features: Any) -> Any:
+    return model(features)
+
+
+def _model_device(torch: Any, model: Any) -> Any:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _resolve_torch_device(torch: Any, requested: str) -> Any:
+    if requested not in {"cpu", "cuda", "auto"}:
+        raise ValueError("device must be 'cpu', 'cuda', or 'auto'")
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but no compatible CUDA device is available")
+    return torch.device(requested)
+
+
+def _set_deterministic_seed(torch: Any, seed: int) -> None:
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise ValueError("train_seed must be an integer")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def _median_inverse_validation_mae(

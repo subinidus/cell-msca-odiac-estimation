@@ -479,7 +479,10 @@ class Phase3BaselineTests(unittest.TestCase):
         )
         values = config.to_dict(train_seed=9, target_scale=1.0)
         self.assertEqual(values["optimizer"], "AdamW")
-        self.assertEqual(values["weight_decay_scope"], "weights_only_no_bias")
+        self.assertEqual(
+            values["weight_decay_scope"],
+            "weights_only_no_bias_or_normalization",
+        )
         self.assertEqual(values["loss"], "log_huber")
         self.assertEqual(values["huber_delta"], 0.75)
         self.assertEqual(values["dropout"], 0.2)
