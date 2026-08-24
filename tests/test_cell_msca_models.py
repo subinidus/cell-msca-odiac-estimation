@@ -1,11 +1,15 @@
-"""Synthetic architecture and runtime regression tests for Phase 4.1."""
+"""Synthetic architecture and runtime regression tests for Phase 4."""
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -27,6 +31,7 @@ if torch is not None:
         SOCIO_INFRASTRUCTURE_FEATURES,
         CellMSCA,
         CellMSCAConfig,
+        DirectionalCrossAttention,
         count_trainable_parameters,
         variant_parameter_counts,
     )
@@ -37,10 +42,13 @@ if torch is not None:
     )
     from cell_msca.train import (
         CELL_MSCA_CHECKPOINT_SCHEMA_VERSION,
-        CellMSCACheckpointProvenance,
+        GIT_DIRTY_STATE_POLICY,
         CellMSCATrainingConfig,
+        checkpoint_manifest_json,
+        discover_git_state,
         fit_cell_msca,
         load_selected_checkpoint,
+        save_selected_checkpoint,
     )
 
 
@@ -105,6 +113,25 @@ class CellMSCAModelTests(unittest.TestCase):
         torch.testing.assert_close(base_tokens[:, 2], changed_tokens[:, 2])
         self.assertFalse(torch.equal(base_tokens[:, 1], changed_tokens[:, 1]))
 
+    def test_numerical_tokenizer_is_exact_feature_specific_affine_map(self) -> None:
+        model = CellMSCA(self.base_config)
+        tokenizer = model.pollution_tokenizer
+        values = self.pollution[:2]
+        expected = (
+            values.unsqueeze(-1) * tokenizer.weight.unsqueeze(0)
+            + tokenizer.bias.unsqueeze(0)
+        )
+        actual = tokenizer(values)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        parameter_names = dict(tokenizer.named_parameters())
+        self.assertEqual(set(parameter_names), {"weight", "bias"})
+        self.assertNotIn("feature_embedding", parameter_names)
+        self.assertNotIn("group_embedding", parameter_names)
+        self.assertEqual(
+            model.config.to_dict()["tokenizer"],
+            "feature_specific_affine_z_f_equals_x_f_w_f_plus_b_f",
+        )
+
     def test_exact_output_token_and_attention_shapes_for_all_variants(self) -> None:
         for variant in CELL_MSCA_VARIANTS:
             with self.subTest(variant=variant):
@@ -122,6 +149,7 @@ class CellMSCAModelTests(unittest.TestCase):
                     result.socio_infrastructure_tokens.shape,
                     (4, 4, 8),
                 )
+                self.assertEqual(result.pooled_representation.shape, (4, 16))
                 if variant in {"forward", "bidirectional"}:
                     assert result.forward_attention is not None
                     self.assertEqual(result.forward_attention.shape, (4, 2, 4, 3))
@@ -140,6 +168,96 @@ class CellMSCAModelTests(unittest.TestCase):
                     )
                 else:
                     self.assertIsNone(result.reverse_attention)
+
+    def test_all_variants_pass_two_d_model_to_identical_regression_heads(self) -> None:
+        expected_state_shapes: dict[str, tuple[int, ...]] | None = None
+        for variant in CELL_MSCA_VARIANTS:
+            with self.subTest(variant=variant):
+                model = CellMSCA(replace(self.base_config, variant=variant)).eval()
+                observed_inputs: list[tuple[int, ...]] = []
+
+                def record_head_input(_module: object, inputs: tuple[torch.Tensor, ...]) -> None:
+                    observed_inputs.append(tuple(inputs[0].shape))
+
+                handle = model.regression_head.register_forward_pre_hook(
+                    record_head_input
+                )
+                try:
+                    result = model.forward_with_details(
+                        self.pollution,
+                        self.infrastructure,
+                    )
+                finally:
+                    handle.remove()
+                self.assertEqual(observed_inputs, [(4, 2 * self.base_config.d_model)])
+                self.assertEqual(
+                    tuple(model.regression_head[0].normalized_shape),
+                    (2 * self.base_config.d_model,),
+                )
+                self.assertEqual(
+                    model.regression_head[1].in_features,
+                    2 * self.base_config.d_model,
+                )
+                pooled_pollution = result.pollution_environment_tokens.mean(dim=1)
+                pooled_infrastructure = (
+                    result.socio_infrastructure_tokens.mean(dim=1)
+                )
+                if variant == "token_no_attention":
+                    expected_pooled = torch.cat(
+                        [pooled_pollution, pooled_infrastructure], dim=-1
+                    )
+                elif variant == "forward":
+                    assert model.forward_cross is not None
+                    updated_infrastructure, _ = model.forward_cross(
+                        result.socio_infrastructure_tokens,
+                        result.pollution_environment_tokens,
+                    )
+                    expected_pooled = torch.cat(
+                        [pooled_pollution, updated_infrastructure.mean(dim=1)],
+                        dim=-1,
+                    )
+                elif variant == "reverse":
+                    assert model.reverse_cross is not None
+                    updated_pollution, _ = model.reverse_cross(
+                        result.pollution_environment_tokens,
+                        result.socio_infrastructure_tokens,
+                    )
+                    expected_pooled = torch.cat(
+                        [updated_pollution.mean(dim=1), pooled_infrastructure],
+                        dim=-1,
+                    )
+                else:
+                    assert model.forward_cross is not None
+                    assert model.reverse_cross is not None
+                    updated_infrastructure, _ = model.forward_cross(
+                        result.socio_infrastructure_tokens,
+                        result.pollution_environment_tokens,
+                    )
+                    updated_pollution, _ = model.reverse_cross(
+                        result.pollution_environment_tokens,
+                        result.socio_infrastructure_tokens,
+                    )
+                    expected_pooled = torch.cat(
+                        [
+                            updated_pollution.mean(dim=1),
+                            updated_infrastructure.mean(dim=1),
+                        ],
+                        dim=-1,
+                    )
+                torch.testing.assert_close(
+                    result.pooled_representation,
+                    expected_pooled,
+                    rtol=0,
+                    atol=0,
+                )
+                state_shapes = {
+                    name: tuple(value.shape)
+                    for name, value in model.regression_head.state_dict().items()
+                }
+                if expected_state_shapes is None:
+                    expected_state_shapes = state_shapes
+                else:
+                    self.assertEqual(state_shapes, expected_state_shapes)
 
     def test_finite_forward_backward_and_gradients_reach_both_streams(self) -> None:
         pollution = self.pollution.clone().requires_grad_(True)
@@ -255,22 +373,65 @@ class CellMSCAModelTests(unittest.TestCase):
         no_decay_ids = {id(parameter) for parameter in groups[1]["params"]}
         self.assertEqual(groups[0]["weight_decay"], 0.125)
         self.assertEqual(groups[1]["weight_decay"], 0.0)
+        normalization_ids = {
+            id(parameter)
+            for module in model.modules()
+            if isinstance(module, torch.nn.LayerNorm)
+            for parameter in module.parameters(recurse=False)
+        }
         for name, parameter in model.named_parameters():
-            if name == "bias" or name.endswith(".bias") or parameter.ndim == 1:
+            if name == "bias" or name.endswith(".bias") or id(parameter) in normalization_ids:
                 self.assertIn(id(parameter), no_decay_ids, name)
                 self.assertNotIn(id(parameter), decay_ids, name)
             else:
                 self.assertIn(id(parameter), decay_ids, name)
+
+        class ArbitraryVectorModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.feature_scale = torch.nn.Parameter(torch.ones(5))
+                self.normalization = torch.nn.LayerNorm(5)
+                self.projection = torch.nn.Linear(5, 1)
+
+        fixture = ArbitraryVectorModel()
+        fixture_groups = _adamw_parameter_groups(fixture, weight_decay=0.125)
+        fixture_decay_ids = {id(parameter) for parameter in fixture_groups[0]["params"]}
+        fixture_no_decay_ids = {
+            id(parameter) for parameter in fixture_groups[1]["params"]
+        }
+        self.assertIn(id(fixture.feature_scale), fixture_decay_ids)
+        self.assertNotIn(id(fixture.feature_scale), fixture_no_decay_ids)
+        self.assertIn(id(fixture.normalization.weight), fixture_no_decay_ids)
+        self.assertIn(id(fixture.normalization.bias), fixture_no_decay_ids)
 
     def test_variant_parameter_counts_are_reported_and_structurally_expected(self) -> None:
         counts = variant_parameter_counts(self.base_config)
         self.assertEqual(set(counts), set(CELL_MSCA_VARIANTS))
         self.assertTrue(all(count > 0 for count in counts.values()))
         self.assertEqual(counts["forward"], counts["reverse"])
-        self.assertGreater(counts["bidirectional"], counts["forward"])
+        cross_attention_parameters = count_trainable_parameters(
+            DirectionalCrossAttention(self.base_config)
+        )
+        self.assertEqual(
+            counts["forward"] - counts["token_no_attention"],
+            cross_attention_parameters,
+        )
+        self.assertEqual(
+            counts["bidirectional"] - counts["token_no_attention"],
+            2 * cross_attention_parameters,
+        )
         self.assertEqual(
             counts["forward"],
             count_trainable_parameters(CellMSCA(self.base_config)),
+        )
+        self.assertEqual(
+            variant_parameter_counts(),
+            {
+                "token_no_attention": 19_905,
+                "forward": 28_577,
+                "reverse": 28_577,
+                "bidirectional": 37_249,
+            },
         )
 
     def test_device_resolution_is_explicit(self) -> None:
@@ -317,11 +478,13 @@ class CellMSCAModelTests(unittest.TestCase):
                 "preprocessing_sha256": data.provenance.preprocessing_sha256,
                 "configuration_sha256": fitted.contract.config_sha256,
             }
-            loaded = load_selected_checkpoint(
-                path,
-                device="cpu",
-                expected_hashes=expected_hashes,
-            )
+            with mock.patch.object(torch, "load", wraps=torch.load) as safe_load:
+                loaded = load_selected_checkpoint(
+                    path,
+                    device="cpu",
+                    expected_hashes=expected_hashes,
+                )
+            self.assertTrue(safe_load.call_args.kwargs["weights_only"])
             features = data.validation.features
             pollution = torch.as_tensor(features[:, :3], dtype=torch.float32)
             infrastructure = torch.as_tensor(features[:, 3:], dtype=torch.float32)
@@ -335,14 +498,21 @@ class CellMSCAModelTests(unittest.TestCase):
                 CELL_MSCA_CHECKPOINT_SCHEMA_VERSION,
                 "cell_msca.selected_checkpoint.v1",
             )
+            self.assertEqual(
+                loaded.provenance.git_dirty_state_policy,
+                GIT_DIRTY_STATE_POLICY,
+            )
+            manifest = json.loads(checkpoint_manifest_json(loaded))
+            self.assertEqual(
+                manifest["git_dirty_state_policy"],
+                GIT_DIRTY_STATE_POLICY,
+            )
             with self.assertRaisesRegex(ValueError, "data_sha256 mismatch"):
                 load_selected_checkpoint(
                     path,
                     expected_hashes={"data_sha256": "f" * 64},
                 )
             with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
-                from cell_msca.train import save_selected_checkpoint
-
                 save_selected_checkpoint(
                     path,
                     model=fitted.model,
@@ -352,6 +522,79 @@ class CellMSCAModelTests(unittest.TestCase):
                     best_epoch=fitted.contract.best_epoch or 1,
                     validation_original_mae=0.0,
                 )
+
+            atomic_path = Path(directory) / "atomic.pt"
+            with mock.patch("cell_msca.train.os.replace", wraps=os.replace) as replace_call:
+                save_selected_checkpoint(
+                    atomic_path,
+                    model=fitted.model,
+                    config=config,
+                    contract=fitted.contract,
+                    provenance=fitted.checkpoint_provenance,
+                    best_epoch=fitted.contract.best_epoch or 1,
+                    validation_original_mae=0.0,
+                )
+            self.assertTrue(atomic_path.is_file())
+            replace_call.assert_called_once()
+            temporary_source, final_destination = replace_call.call_args.args
+            self.assertEqual(Path(temporary_source).parent, atomic_path.parent)
+            self.assertEqual(Path(final_destination), atomic_path)
+            self.assertFalse(Path(temporary_source).exists())
+
+            failed_path = Path(directory) / "failed.pt"
+
+            def fail_after_partial_write(_payload: object, temporary: Path) -> None:
+                Path(temporary).write_bytes(b"partial")
+                raise RuntimeError("synthetic checkpoint write failure")
+
+            with mock.patch(
+                "cell_msca.train.torch.save",
+                side_effect=fail_after_partial_write,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic checkpoint"):
+                    save_selected_checkpoint(
+                        failed_path,
+                        model=fitted.model,
+                        config=config,
+                        contract=fitted.contract,
+                        provenance=fitted.checkpoint_provenance,
+                        best_epoch=fitted.contract.best_epoch or 1,
+                        validation_original_mae=0.0,
+                    )
+            self.assertFalse(failed_path.exists())
+            self.assertEqual(
+                list(Path(directory).glob(f".{failed_path.name}.*.tmp")),
+                [],
+            )
+
+    def test_git_dirty_state_includes_untracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for command in (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.name", "Phase 4 Test"],
+                ["git", "config", "user.email", "phase4@example.invalid"],
+            ):
+                subprocess.run(command, cwd=root, check=True, capture_output=True)
+            tracked = root / "tracked.txt"
+            tracked.write_text("tracked\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "tracked.txt"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "test fixture"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            _commit, dirty = discover_git_state(root)
+            self.assertFalse(dirty)
+            (root / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+            _commit, dirty = discover_git_state(root)
+            self.assertTrue(dirty)
 
     @staticmethod
     def _tiny_tuning_data() -> TuningData:

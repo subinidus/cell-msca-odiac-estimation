@@ -234,7 +234,7 @@ For `v2_corrected`, missing-value statistics must also be derived from train cel
 Each scalar remains a separate token:
 
 \[
-z_f^{(0)}=w_f\tilde x_f+b_f+e_f+e_{group(f)}.
+z_f^{(0)}=\tilde x_f w_f+b_f.
 \]
 
 Thus
@@ -277,13 +277,49 @@ U_I=Z_I+Dropout\left(Concat_h(H^h_{I\leftarrow P})W_O\right),
 
 with the symmetric expression for `P <- I`.
 
-The bidirectional representation is
+Every token variant uses the same two-stream pooled width and the same regression
+head. Let `Pool` denote mean pooling over the feature-token dimension. The four
+representations are:
 
 \[
-h=Concat(MeanPool(\tilde Z_{I\leftarrow P}),MeanPool(\tilde Z_{P\leftarrow I})),
+h_{no-cross}=Concat(Pool(Z_P),Pool(Z_I)),
 \]
 
-followed by a scalar regression head. The one-way models pool only their updated query stream.
+\[
+h_{forward}=Concat(Pool(Z_P),Pool(\tilde Z_{I\leftarrow P})),
+\]
+
+\[
+h_{reverse}=Concat(Pool(\tilde Z_{P\leftarrow I}),Pool(Z_I)),
+\]
+
+and
+
+\[
+h_{bidirectional}=Concat(Pool(\tilde Z_{P\leftarrow I}),Pool(\tilde Z_{I\leftarrow P})).
+\]
+
+Each representation is in `R^(2*d_model)` and passes through an otherwise
+identical scalar regression head. The tokenizer, independent stream encoders,
+pooling contract, and regression head are matched. The variants are not fully
+parameter matched: forward and reverse add one cross-attention block, while the
+bidirectional variant adds two. These capacity differences must be reported and
+treated as a limitation when interpreting ablations.
+
+For the frozen default architecture (`d_model=32`, `num_heads=4`, one stream
+encoder layer, `ffn_multiplier=2`, and `head_hidden=32`), the trainable parameter
+counts are:
+
+| Variant | Total parameters | Added versus token/no-cross |
+| --- | ---: | ---: |
+| token/no-cross | 19,905 | 0 |
+| forward `I <- P` | 28,577 | 8,672 (one cross-attention block) |
+| reverse `P <- I` | 28,577 | 8,672 (one cross-attention block) |
+| bidirectional | 37,249 | 17,344 (two cross-attention blocks) |
+
+These totals must be recalculated if any architecture dimension changes. They do
+not establish parameter-matched ablations; they quantify the remaining capacity
+confound after matching the tokenizer, stream encoders, pooling, and head.
 
 ## 7. Loss, selection, and evaluation contract
 
@@ -516,7 +552,9 @@ Completion gates:
 - deterministic CPU initialization and prediction are verified;
 - selected-model checkpoint save/reload produces identical predictions;
 - AdamW excludes bias and normalization parameters from weight decay;
-- parameter counts, unavoidable capacity differences, forward/backward shapes, device, runtime versions, configuration hash, split hash, data hash, preprocessing hash, and Git commit SHA are logged for every variant;
+- every variant passes a `2*d_model` pooled representation to the same regression head;
+- tokenizer, stream encoders, pooling contract, and regression head are matched, while the parameters added by one or two cross-attention blocks are reported as an ablation limitation;
+- parameter counts, unavoidable capacity differences, forward/backward shapes, device, runtime versions, configuration hash, split hash, data hash, preprocessing hash, Git commit SHA, and the tracked-plus-untracked dirty-state policy are logged for every variant;
 - actual PyTorch forward, backward, and checkpoint smoke tests pass before Phase 4.1 is declared complete.
 
 ### Phase 5: final experiment

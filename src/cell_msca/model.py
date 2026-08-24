@@ -78,15 +78,15 @@ class CellMSCAConfig:
                 "socio_infrastructure_features": list(
                     SOCIO_INFRASTRUCTURE_FEATURES
                 ),
-                "tokenizer": "feature_specific_affine_plus_feature_and_group_embedding",
+                "tokenizer": "feature_specific_affine_z_f_equals_x_f_w_f_plus_b_f",
                 "encoder_contract": "pre_layernorm_residual_self_attention_ffn",
                 "cross_attention_contract": (
                     "pre_layernorm_q_kv_residual_ffn_same_sample_only"
                 ),
                 "capacity_note": (
-                    "tokenizers and stream encoders are matched; directional "
-                    "cross-attention blocks and one-versus-two-stream pooled heads "
-                    "create unavoidable variant-specific parameter counts"
+                    "tokenizers, stream encoders, two-stream mean pooling, and the "
+                    "2*d_model regression head are matched; one or two directional "
+                    "cross-attention blocks create variant-specific parameter counts"
                 ),
             }
         )
@@ -100,6 +100,7 @@ class CellMSCAForwardResult:
     prediction_log: Tensor
     pollution_environment_tokens: Tensor
     socio_infrastructure_tokens: Tensor
+    pooled_representation: Tensor
     forward_attention: Tensor | None
     reverse_attention: Tensor | None
 
@@ -115,11 +116,7 @@ class FeatureSpecificNumericalTokenizer(nn.Module):
         self.d_model = int(d_model)
         self.weight = nn.Parameter(torch.empty(n_features, d_model))
         self.bias = nn.Parameter(torch.zeros(n_features, d_model))
-        self.feature_embedding = nn.Parameter(torch.empty(n_features, d_model))
-        self.group_embedding = nn.Parameter(torch.empty(d_model))
         nn.init.xavier_uniform_(self.weight)
-        nn.init.normal_(self.feature_embedding, mean=0.0, std=0.02)
-        nn.init.normal_(self.group_embedding, mean=0.0, std=0.02)
 
     def forward(self, values: Tensor) -> Tensor:
         if values.ndim != 2 or values.shape[1] != self.n_features:
@@ -127,12 +124,7 @@ class FeatureSpecificNumericalTokenizer(nn.Module):
                 f"numerical tokenizer expects [batch, {self.n_features}]; "
                 f"got {tuple(values.shape)}"
             )
-        return (
-            values.unsqueeze(-1) * self.weight.unsqueeze(0)
-            + self.bias.unsqueeze(0)
-            + self.feature_embedding.unsqueeze(0)
-            + self.group_embedding.view(1, 1, -1)
-        )
+        return values.unsqueeze(-1) * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
 
 
 def _feed_forward(d_model: int, ffn_multiplier: int, dropout: float) -> nn.Module:
@@ -260,11 +252,7 @@ class CellMSCA(nn.Module):
         if self.config.variant in {"reverse", "bidirectional"}:
             self.reverse_cross = DirectionalCrossAttention(self.config)
 
-        pooled_width = (
-            self.config.d_model
-            if self.config.variant in {"forward", "reverse"}
-            else self.config.d_model * 2
-        )
+        pooled_width = self.config.d_model * 2
         self.regression_head = nn.Sequential(
             nn.LayerNorm(pooled_width),
             nn.Linear(pooled_width, self.config.head_hidden),
@@ -297,9 +285,11 @@ class CellMSCA(nn.Module):
 
         forward_attention: Tensor | None = None
         reverse_attention: Tensor | None = None
+        pooled_pollution = pollution_tokens.mean(dim=1)
+        pooled_infrastructure = infrastructure_tokens.mean(dim=1)
         if self.config.variant == "token_no_attention":
             pooled = torch.cat(
-                [pollution_tokens.mean(dim=1), infrastructure_tokens.mean(dim=1)],
+                [pooled_pollution, pooled_infrastructure],
                 dim=-1,
             )
         elif self.config.variant == "forward":
@@ -309,7 +299,10 @@ class CellMSCA(nn.Module):
                 infrastructure_tokens,
                 pollution_tokens,
             )
-            pooled = updated.mean(dim=1)
+            pooled = torch.cat(
+                [pooled_pollution, updated.mean(dim=1)],
+                dim=-1,
+            )
         elif self.config.variant == "reverse":
             if self.reverse_cross is None:  # pragma: no cover - constructor invariant
                 raise RuntimeError("reverse cross-attention module is missing")
@@ -317,7 +310,10 @@ class CellMSCA(nn.Module):
                 pollution_tokens,
                 infrastructure_tokens,
             )
-            pooled = updated.mean(dim=1)
+            pooled = torch.cat(
+                [updated.mean(dim=1), pooled_infrastructure],
+                dim=-1,
+            )
         else:
             if self.forward_cross is None or self.reverse_cross is None:
                 raise RuntimeError("bidirectional cross-attention modules are missing")
@@ -342,6 +338,7 @@ class CellMSCA(nn.Module):
             prediction_log=prediction,
             pollution_environment_tokens=pollution_tokens,
             socio_infrastructure_tokens=infrastructure_tokens,
+            pooled_representation=pooled,
             forward_attention=forward_attention,
             reverse_attention=reverse_attention,
         )
@@ -405,7 +402,7 @@ def count_trainable_parameters(model: nn.Module) -> int:
 
 
 def variant_parameter_counts(config: CellMSCAConfig | None = None) -> dict[str, int]:
-    """Instantiate capacity-matched variants and report unavoidable differences."""
+    """Report matched-core variants plus cross-attention capacity differences."""
 
     base = config or CellMSCAConfig()
     return {

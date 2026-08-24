@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import platform
 import re
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -32,6 +34,7 @@ from .neural_baselines import (
 from .target import inverse_target
 
 CELL_MSCA_CHECKPOINT_SCHEMA_VERSION = "cell_msca.selected_checkpoint.v1"
+GIT_DIRTY_STATE_POLICY = "tracked_and_untracked_files"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -114,6 +117,7 @@ class CellMSCACheckpointProvenance:
     numpy_version: str
     package_versions: dict[str, str]
     device: str
+    git_dirty_state_policy: str = GIT_DIRTY_STATE_POLICY
 
     def __post_init__(self) -> None:
         for name in (
@@ -131,6 +135,10 @@ class CellMSCACheckpointProvenance:
         if not _GIT_SHA_PATTERN.fullmatch(git_sha):
             raise ValueError("git_commit_sha must be a 40-64 character hex digest")
         object.__setattr__(self, "git_commit_sha", git_sha)
+        if self.git_dirty_state_policy != GIT_DIRTY_STATE_POLICY:
+            raise ValueError(
+                "git_dirty_state_policy must include tracked and untracked files"
+            )
         if self.split_seed == self.train_seed:
             # Equal values are allowed, but the separately named fields remain mandatory.
             pass
@@ -309,7 +317,11 @@ def save_selected_checkpoint(
     if not np.isfinite(validation_original_mae) or validation_original_mae < 0.0:
         raise ValueError("validation_original_mae must be finite and non-negative")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    count = parameter_count or count_trainable_parameters(model)
+    count = (
+        count_trainable_parameters(model)
+        if parameter_count is None
+        else parameter_count
+    )
     payload = {
         "schema_version": CELL_MSCA_CHECKPOINT_SCHEMA_VERSION,
         "architecture_config": asdict(config.architecture),
@@ -336,7 +348,25 @@ def save_selected_checkpoint(
         },
         "model_state_dict": model.state_dict(),
     }
-    torch.save(payload, destination)
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        torch.save(payload, temporary_path)
+        if destination.exists():
+            raise FileExistsError(
+                f"refusing to overwrite checkpoint: {destination}"
+            )
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     return destination
 
 
@@ -352,7 +382,7 @@ def load_selected_checkpoint(
     payload = torch.load(
         Path(path),
         map_location=resolved_device,
-        weights_only=False,
+        weights_only=True,
     )
     if not isinstance(payload, dict):
         raise ValueError("Cell-MSCA checkpoint payload must be a mapping")
@@ -408,7 +438,7 @@ def load_selected_checkpoint(
 
 
 def discover_git_state(repository_root: str | Path | None = None) -> tuple[str, bool]:
-    """Return the exact checked-out commit and whether tracked files are dirty."""
+    """Return the commit and tracked-plus-untracked worktree dirty state."""
 
     root = Path(repository_root) if repository_root is not None else Path.cwd()
     commit = subprocess.run(
@@ -419,7 +449,7 @@ def discover_git_state(repository_root: str | Path | None = None) -> tuple[str, 
         text=True,
     ).stdout.strip()
     status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
         cwd=root,
         check=True,
         capture_output=True,
@@ -446,6 +476,7 @@ def checkpoint_manifest_json(checkpoint: LoadedCellMSCACheckpoint) -> str:
             "schema_version": CELL_MSCA_CHECKPOINT_SCHEMA_VERSION,
             "model_contract": asdict(checkpoint.contract),
             "provenance": checkpoint.provenance.to_dict(),
+            "git_dirty_state_policy": checkpoint.provenance.git_dirty_state_policy,
             "parameter_count": checkpoint.parameter_count,
             "best_epoch": checkpoint.best_epoch,
             "test_evaluated": False,

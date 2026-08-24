@@ -304,19 +304,38 @@ def _adamw_parameter_groups(
     *,
     weight_decay: float,
 ) -> list[dict[str, Any]]:
+    normalization_type_names = {
+        "BatchNorm1d",
+        "BatchNorm2d",
+        "BatchNorm3d",
+        "GroupNorm",
+        "InstanceNorm1d",
+        "InstanceNorm2d",
+        "InstanceNorm3d",
+        "LayerNorm",
+        "LocalResponseNorm",
+        "RMSNorm",
+        "SyncBatchNorm",
+    }
+    normalization_parameter_ids: set[int] = set()
+    modules = getattr(model, "modules", None)
+    if callable(modules):
+        for module in modules():
+            module_type_names = {
+                base.__name__ for base in type(module).__mro__
+            }
+            if module_type_names.isdisjoint(normalization_type_names):
+                continue
+            for parameter in module.parameters(recurse=False):
+                normalization_parameter_ids.add(id(parameter))
+
     weights: list[Any] = []
     no_decay: list[Any] = []
     for name, parameter in model.named_parameters():
         if not getattr(parameter, "requires_grad", True):
             continue
-        parameter_ndim = getattr(parameter, "ndim", None)
         is_bias = name == "bias" or name.endswith(".bias")
-        is_normalization = (
-            parameter_ndim == 1
-            or ".norm." in name
-            or name.startswith("norm.")
-            or "layernorm" in name.lower()
-        )
+        is_normalization = id(parameter) in normalization_parameter_ids
         if is_bias or is_normalization:
             no_decay.append(parameter)
         else:
