@@ -35,6 +35,13 @@ from .target import inverse_target
 
 CELL_MSCA_CHECKPOINT_SCHEMA_VERSION = "cell_msca.selected_checkpoint.v1"
 GIT_DIRTY_STATE_POLICY = "tracked_and_untracked_files"
+ATTACHED_CODE_GIT_STATE_POLICY = (
+    "attached_code_dataset_exact_sha_file_no_worktree_status"
+)
+GIT_DIRTY_STATE_POLICIES = {
+    GIT_DIRTY_STATE_POLICY,
+    ATTACHED_CODE_GIT_STATE_POLICY,
+}
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -135,9 +142,9 @@ class CellMSCACheckpointProvenance:
         if not _GIT_SHA_PATTERN.fullmatch(git_sha):
             raise ValueError("git_commit_sha must be a 40-64 character hex digest")
         object.__setattr__(self, "git_commit_sha", git_sha)
-        if self.git_dirty_state_policy != GIT_DIRTY_STATE_POLICY:
+        if self.git_dirty_state_policy not in GIT_DIRTY_STATE_POLICIES:
             raise ValueError(
-                "git_dirty_state_policy must include tracked and untracked files"
+                "git_dirty_state_policy must record a supported source-state policy"
             )
         if self.split_seed == self.train_seed:
             # Equal values are allowed, but the separately named fields remain mandatory.
@@ -261,6 +268,7 @@ def build_checkpoint_provenance(
     device: str,
     git_commit_sha: str,
     git_worktree_dirty: bool,
+    git_dirty_state_policy: str = GIT_DIRTY_STATE_POLICY,
 ) -> CellMSCACheckpointProvenance:
     packages: dict[str, str] = {}
     for distribution in (
@@ -288,6 +296,7 @@ def build_checkpoint_provenance(
         target_scale=data.provenance.target_scale,
         git_commit_sha=git_commit_sha,
         git_worktree_dirty=bool(git_worktree_dirty),
+        git_dirty_state_policy=git_dirty_state_policy,
         python_version=platform.python_version(),
         pytorch_version=str(torch.__version__),
         numpy_version=str(np.__version__),
