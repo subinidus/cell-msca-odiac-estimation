@@ -1,0 +1,129 @@
+project:
+  name: carbon-hotspot-detection
+  gee_project_id: carbon-detection
+
+region:
+  name: delhi_ncr
+  min_lon: 76.5
+  max_lon: 77.8
+  min_lat: 28.1
+  max_lat: 29.3
+  grid_crs: EPSG:32643
+  output_crs: EPSG:4326
+  cell_size_m: 1000
+
+date:
+  mode: monthly_range
+  start_month: 2022-01
+  end_month: 2024-12
+
+temporal:
+  mode: monthly_mean
+  future_supported_modes:
+    - daily_sequence
+
+gee:
+  batch_size: 500
+  tile_scale: 4
+
+paths:
+  grid_geojson: data/grid/delhi_ncr_1km_grid.geojson
+  grid_csv: data/grid/delhi_ncr_1km_grid.csv
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  odiactif_pattern: data/raw/odiac/odiac2025_1km_excl_intl_{yy}{mm}.tif
+
+
+features:
+  no2:
+    type: image
+    collection: COPERNICUS/S5P/OFFL/L3_NO2
+    band: tropospheric_NO2_column_number_density
+    output_column: no2_mean
+    stream: stream_a
+    scale: 1000
+    reducer: mean
+    temporal_resolution: monthly
+    fill_method: mean
+
+  so2:
+    type: image
+    collection: COPERNICUS/S5P/OFFL/L3_SO2
+    band: SO2_column_number_density
+    output_column: so2_mean
+    stream: stream_a
+    scale: 1000
+    reducer: mean
+    temporal_resolution: monthly
+    fill_method: mean
+
+  co:
+    type: image
+    collection: COPERNICUS/S5P/OFFL/L3_CO
+    band: CO_column_number_density
+    output_column: co_mean
+    stream: stream_a
+    scale: 1000
+    reducer: mean
+    temporal_resolution: monthly
+    fill_method: mean
+
+  nightlight:
+    type: image
+    collection: NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG
+    band: avg_rad
+    output_column: nightlight_mean
+    stream: stream_b
+    scale: 500
+    reducer: mean
+    temporal_resolution: monthly
+    fill_method: mean
+
+  urban_fraction:
+    type: landcover_fraction
+    collection: MODIS/061/MCD12Q1
+    band: LC_Type1
+    output_column: urban_fraction
+    stream: stream_b
+    scale: 500
+    reducer: mean
+    temporal_resolution: yearly
+    landcover_class_value: 13
+    fill_method: zero
+
+  power_plants:
+    type: vector_power_plant
+    collection: WRI/GPPD/power_plants
+    stream: stream_b
+    output_columns:
+      - power_plant_count
+      - fossil_capacity_mw
+    capacity_column: capacitymw
+    fuel_column: fuel1
+    fossil_fuels:
+      - Coal
+      - Gas
+      - Oil
+      - Petcoke
+    fill_method: zero
+
+label:
+  source: ODIAC
+  label_column: label_reg
+  log_column: label_reg_log
+  class_column: label_cls
+  n_classes: 5
+  method: quantile
+  quantile_scope: global_range
+
+run:
+  create_grid: true
+  extract_features: true
+  clean_features: true
+  extract_label: true
+  create_label_cls: true
+  build_final_dataset: true
+  build_tensor: true
+  build_combined_dataset: true
+  build_tensor_index: true
