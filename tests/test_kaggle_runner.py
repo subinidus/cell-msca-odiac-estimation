@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import numpy as np
 
 try:
     import torch
@@ -15,10 +16,15 @@ except (ImportError, OSError):  # pragma: no cover - dependency-error path
     torch = None  # type: ignore[assignment]
 
 from cell_msca.baselines import TestEvaluationBlockedError, TuningData
+from cell_msca.data import CellDataset, canonical_npz_content_sha256, file_sha256
 from cell_msca.kaggle_runner import (
+    ATTACHED_SOURCE_POLICY,
     ARTIFACT_CLASSIFICATIONS,
     EXPERIMENT_ASSIGNMENT_SCHEMA_VERSION,
     GitIdentity,
+    _synthetic_tuning_data,
+    _write_synthetic_month,
+    collect_environment,
     deterministic_experiment_id,
     load_experiment_assignments,
     load_kaggle_validation_config,
@@ -26,7 +32,23 @@ from cell_msca.kaggle_runner import (
     run_kaggle_validation,
     validate_execution_paths,
     validate_experiment_assignments,
+    write_source_tree_manifest,
 )
+from cell_msca.splits import CellFixedSplitConfig
+
+
+def _write_minimal_attached_source(root: Path) -> None:
+    files = {
+        "src/cell_msca/module.py": "VALUE = 1\n",
+        "configs/smoke.json": "{}\n",
+        "notebooks/cell_msca_kaggle_validation.ipynb": "{}\n",
+        "pyproject.toml": "[project]\nname = 'example'\nversion = '0'\n",
+        "requirements.txt": "numpy>=1.24\n",
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
 
 class KaggleRunnerContractTests(unittest.TestCase):
@@ -82,8 +104,9 @@ class KaggleRunnerContractTests(unittest.TestCase):
             "device": "cpu",
             "data_sha256": "1" * 64,
             "split_sha256": "2" * 64,
-            "preprocessing_sha256": "3" * 64,
-            "configuration_sha256": "4" * 64,
+            "split_config_sha256": "3" * 64,
+            "preprocessing_sha256": "4" * 64,
+            "configuration_sha256": "5" * 64,
             "git_commit_sha": "a" * 40,
         }
         first = deterministic_experiment_id(**values)
@@ -96,6 +119,12 @@ class KaggleRunnerContractTests(unittest.TestCase):
         self.assertNotEqual(
             first,
             deterministic_experiment_id(**{**values, "variant": "reverse"}),
+        )
+        self.assertNotEqual(
+            first,
+            deterministic_experiment_id(
+                **{**values, "split_config_sha256": "6" * 64}
+            ),
         )
 
     def test_config_and_assignment_templates_are_frozen_and_unique(self) -> None:
@@ -119,6 +148,87 @@ class KaggleRunnerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate experiment IDs"):
             validate_experiment_assignments(duplicate)
 
+    def test_npz_content_hash_is_serializer_and_byte_order_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plain = root / "plain.npz"
+            compressed = root / "compressed.npz"
+            little = np.asarray([1.5, -2.0, 3.25], dtype="<f8")
+            big = little.astype(">f8")
+            arrays_plain = {
+                "z_values": big,
+                "a_shape": np.arange(6, dtype=np.int32).reshape(2, 3),
+                "metadata": np.asarray("2026-01"),
+            }
+            arrays_compressed = {
+                "metadata": np.asarray("2026-01"),
+                "a_shape": np.arange(6, dtype="<i4").reshape(2, 3),
+                "z_values": little,
+            }
+            np.savez(plain, **arrays_plain)
+            np.savez_compressed(compressed, **arrays_compressed)
+            self.assertNotEqual(file_sha256(plain), file_sha256(compressed))
+            self.assertEqual(
+                canonical_npz_content_sha256(plain),
+                canonical_npz_content_sha256(compressed),
+            )
+
+    def test_npz_content_hash_rejects_object_dtype(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "object.npz"
+            np.savez(path, unsafe=np.asarray([{"value": 1}], dtype=object))
+            with self.assertRaisesRegex(ValueError, "object dtype"):
+                canonical_npz_content_sha256(path)
+
+    def test_content_mode_manifest_keeps_file_and_content_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "month.npz"
+            _write_synthetic_month(path, month_index=0)
+            dataset = CellDataset(
+                [path],
+                data_hash_mode="canonical_npz_content",
+            )
+            entry = dataset.data_manifest[0]
+            self.assertEqual(entry["file_sha256"], file_sha256(path))
+            self.assertEqual(
+                entry["content_sha256"],
+                canonical_npz_content_sha256(path),
+            )
+            self.assertNotEqual(entry["file_sha256"], entry["content_sha256"])
+
+    def test_synthetic_content_and_preprocessing_hash_repeat_three_times(self) -> None:
+        values = load_kaggle_validation_config(self.smoke_config)
+        split = values["split"]
+        config = CellFixedSplitConfig(
+            split_seed=int(split["split_seed"]),
+            validation_ratio=float(split["validation_ratio"]),
+            test_ratio=float(split["test_ratio"]),
+        )
+        hashes: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(3):
+                run_root = root / f"run-{index}"
+                run_root.mkdir()
+                data = _synthetic_tuning_data(
+                    run_root,
+                    split_config=config,
+                    train_seed=int(values["frozen_train_seed"]),
+                    target_scale=float(values["data"]["target_scale"]),
+                )
+                hashes.append(
+                    (
+                        data.provenance.data_sha256,
+                        data.provenance.preprocessing_sha256,
+                    )
+                )
+        self.assertEqual(len(set(hashes)), 1)
+        self.assertEqual(hashes[0][0], values["required_hashes"]["data_sha256"])
+        self.assertEqual(
+            hashes[0][1],
+            values["required_hashes"]["preprocessing_sha256"],
+        )
+
     def test_config_structurally_rejects_test_materialization(self) -> None:
         original = load_kaggle_validation_config(self.smoke_config)
         with tempfile.TemporaryDirectory() as directory:
@@ -139,28 +249,71 @@ class KaggleRunnerContractTests(unittest.TestCase):
             with self.assertRaises(TestEvaluationBlockedError):
                 load_kaggle_validation_config(path)
 
-    def test_attached_code_sha_file_supports_source_without_git_metadata(self) -> None:
+    def test_attached_source_requires_and_verifies_complete_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _write_minimal_attached_source(root)
             declaration = root / "GIT_COMMIT_SHA.txt"
             declaration.write_text("a" * 40 + "\n", encoding="utf-8")
-            error = subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
-            with mock.patch(
-                "cell_msca.train.discover_git_state",
-                side_effect=error,
-            ):
-                identity = resolve_git_identity(
-                    root,
-                    expected_git_sha="a" * 40,
-                    source_git_sha_file=declaration,
-                )
+            manifest = root / "SOURCE_TREE_MANIFEST.json"
+            manifest_sha256 = write_source_tree_manifest(
+                root,
+                manifest,
+                git_commit_sha="a" * 40,
+            )
+            identity = resolve_git_identity(
+                root,
+                expected_git_sha="a" * 40,
+                source_git_sha_file=declaration,
+                source_tree_manifest=manifest,
+                expected_source_manifest_sha256=manifest_sha256,
+            )
             self.assertEqual(identity.commit_sha, "a" * 40)
             self.assertEqual(identity.source, "attached_private_code_dataset")
             self.assertFalse(identity.worktree_dirty)
-            self.assertEqual(
-                identity.dirty_state_policy,
-                "attached_code_dataset_exact_sha_file_no_worktree_status",
+            self.assertEqual(identity.dirty_state_policy, ATTACHED_SOURCE_POLICY)
+            self.assertEqual(identity.source_manifest_sha256, manifest_sha256)
+            self.assertEqual(identity.verified_source_file_count, 5)
+
+    def test_attached_source_detects_mutated_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_minimal_attached_source(root)
+            declaration = root / "GIT_COMMIT_SHA.txt"
+            declaration.write_text("a" * 40 + "\n", encoding="utf-8")
+            manifest = root / "SOURCE_TREE_MANIFEST.json"
+            manifest_sha256 = write_source_tree_manifest(
+                root,
+                manifest,
+                git_commit_sha="a" * 40,
             )
+            (root / "src/cell_msca/module.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "source file SHA-256 mismatch"):
+                resolve_git_identity(
+                    root,
+                    expected_git_sha="a" * 40,
+                    source_git_sha_file=declaration,
+                    source_tree_manifest=manifest,
+                    expected_source_manifest_sha256=manifest_sha256,
+                )
+
+    def test_attached_source_without_manifest_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_minimal_attached_source(root)
+            declaration = root / "GIT_COMMIT_SHA.txt"
+            declaration.write_text("a" * 40 + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(FileNotFoundError, "manifest is missing"):
+                resolve_git_identity(
+                    root,
+                    expected_git_sha="a" * 40,
+                    source_git_sha_file=declaration,
+                    source_tree_manifest=root / "missing-manifest.json",
+                    expected_source_manifest_sha256="b" * 64,
+                )
 
     def test_notebook_is_thin_has_no_outputs_and_contains_no_install_step(self) -> None:
         notebook_path = (
@@ -182,6 +335,15 @@ class KaggleRunnerContractTests(unittest.TestCase):
         self.assertNotIn("api_token", code.lower())
         self.assertNotIn("kaggle.json", code.lower())
 
+    def test_missing_torch_dependency_fails_clearly_and_restores_patch(self) -> None:
+        with mock.patch(
+            "cell_msca.kaggle_runner.importlib.import_module",
+            side_effect=ImportError("torch unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PyTorch is required"):
+                collect_environment()
+
+    @unittest.skipIf(torch is None, "configuration execution requires PyTorch")
     def test_exact_configuration_and_git_hashes_are_required(self) -> None:
         original = load_kaggle_validation_config(self.smoke_config)
         with tempfile.TemporaryDirectory() as directory:
@@ -259,8 +421,10 @@ class KaggleRunnerContractTests(unittest.TestCase):
         identity = GitIdentity(
             "a" * 40,
             False,
-            "attached_code_dataset_exact_sha_file_no_worktree_status",
+            ATTACHED_SOURCE_POLICY,
             "attached_private_code_dataset",
+            source_manifest_sha256="b" * 64,
+            verified_source_file_count=5,
         )
         subset_names: list[str] = []
         original_subset = TuningData.subset
@@ -292,8 +456,10 @@ class KaggleRunnerContractTests(unittest.TestCase):
             self.assertFalse(manifest["test_subset_materialized"])
             self.assertEqual(
                 manifest["git_dirty_state_policy"],
-                "attached_code_dataset_exact_sha_file_no_worktree_status",
+                ATTACHED_SOURCE_POLICY,
             )
+            self.assertEqual(manifest["source_manifest_sha256"], "b" * 64)
+            self.assertEqual(manifest["verified_source_file_count"], 5)
             self.assertEqual(
                 manifest["allowed_materialized_splits"],
                 ["train", "validation"],

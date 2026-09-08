@@ -11,6 +11,7 @@
   "data": {
     "mode": "synthetic",
     "synthetic_schema_version": "cell_msca.synthetic_validation.v1",
+    "data_hash_mode": "canonical_npz_content",
     "target_scale": 1.0
   },
   "split": {
@@ -38,10 +39,10 @@
     "weight_decay": 0.00001
   },
   "required_hashes": {
-    "data_sha256": "1774caa34fd94e32857899b6a756bfdd24e9c46f1a3be89287ae15a49f12d489",
+    "data_sha256": "ee78d9c10f803229591adfeaaa600fdfb2186570a6a60cd46e4614fd0f740bfe",
     "split_sha256": "51c630370909a39659a369379b79f605550734a68869527191fec9c0548ded3a",
     "split_config_sha256": "eee79ad53fe4ff868668f377d1e66ea9e273ebb3c17838d3f88356e28a3c7ee1",
-    "preprocessing_sha256": "03f3fa6d75817a49a16eee44cc5110e04ceac074dd756e16e604b2b481038161",
+    "preprocessing_sha256": "9f7225aaf157519c004516a4a48a147a636200e221c092162409dd53294000a3",
     "configuration_sha256_by_variant_and_device": {
       "token_no_attention:cpu": "3df0272f1b31d4a90d5147c64fc62c93ad923de66a376e1c28e99aae003a6051",
       "token_no_attention:cuda": "7aae1d551ebfa46a97a23e73ebae898b130360479516bf10db509554a3578814",

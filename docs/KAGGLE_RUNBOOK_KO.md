@@ -28,10 +28,11 @@
 - Kaggle에서는 Internet 설정과 관계없이 `/kaggle/input`을 read-only로 취급하고
   `/kaggle/working` 아래만 output으로 사용한다.
 
-runner는 tracked 및 untracked 파일이 없는 정확한 Git checkout을 요구한다. `.git`
-정보가 없는 private code dataset은 packaging 시점의 commit SHA만 담은
-`GIT_COMMIT_SHA.txt`를 함께 제공해야 한다. 이 파일은 credential이 아니며 정확히
-한 줄의 40자리 또는 64자리 Git SHA만 포함해야 한다.
+runner는 tracked 및 untracked 파일이 없는 정확한 Git checkout을 요구한다. private
+code dataset은 `GIT_COMMIT_SHA.txt`, `SOURCE_TREE_MANIFEST.json`, 그리고 coordinator가
+별도 전달한 manifest SHA-256을 함께 제공해야 한다. SHA 선언만으로 source를 검증된
+상태로 취급하지 않는다. manifest는 `src/cell_msca`, 전체 `configs`, Kaggle notebook,
+`pyproject.toml`, `requirements.txt`의 repository-relative path와 SHA-256을 기록한다.
 
 ## 3. Kaggle source 공급 방식
 
@@ -58,6 +59,7 @@ src/cell_msca/
 configs/kaggle_synthetic_smoke.json
 tests/
 GIT_COMMIT_SHA.txt
+SOURCE_TREE_MANIFEST.json
 ```
 
 환경 변수는 다음과 같다.
@@ -65,12 +67,26 @@ GIT_COMMIT_SHA.txt
 ```text
 CELL_MSCA_SOURCE_MODE=attached
 CELL_MSCA_GIT_SHA=<snapshot을 만든 정확한 commit SHA>
+CELL_MSCA_SOURCE_MANIFEST_SHA256=<trusted SOURCE_TREE_MANIFEST.json SHA-256>
 ```
 
-SHA 파일명이 다르면 `CELL_MSCA_SOURCE_SHA_FILE`에 절대 경로를 지정한다. notebook은
+SHA 또는 manifest 파일명이 다르면 `CELL_MSCA_SOURCE_SHA_FILE`과
+`CELL_MSCA_SOURCE_MANIFEST`에 절대 경로를 지정한다. notebook은
 `/kaggle/input`의 바로 아래에서 `src/cell_msca`를 포함한 유일한 dataset을 찾은 뒤
 그 code snapshot을 `/kaggle/working/cell-msca-source`로 복사한다. test, import,
 `compileall`은 working copy에서만 실행하므로 read-only input에는 쓰지 않는다.
+
+신뢰할 수 있는 clean checkout에서 packaging manifest를 생성하는 예시는 다음과 같다.
+출력 파일은 repository 밖의 packaging directory에 둔다.
+
+```powershell
+$commit = git rev-parse HEAD
+$env:PYTHONPATH = "src"
+python -c "from cell_msca.kaggle_runner import write_source_tree_manifest; print(write_source_tree_manifest('.', 'C:/package/SOURCE_TREE_MANIFEST.json', git_commit_sha='$commit'))"
+```
+
+출력된 SHA-256을 `CELL_MSCA_SOURCE_MANIFEST_SHA256`으로 별도 전달한다. 파일 변경,
+누락, 추가 또는 manifest 자체 변경이 있으면 runner는 실행 전에 중단한다.
 
 ## 4. 정확한 로컬 synthetic 명령
 
@@ -122,10 +138,12 @@ python -m cell_msca.kaggle_runner \
   --kaggle
 ```
 
-attached code dataset에 `.git`이 없으면 다음 인자를 추가한다.
+attached code dataset에서는 다음 인자를 추가한다.
 
 ```text
 --source-git-sha-file /kaggle/input/<attached-code>/GIT_COMMIT_SHA.txt
+--source-tree-manifest /kaggle/input/<attached-code>/SOURCE_TREE_MANIFEST.json
+--expected-source-manifest-sha256 <TRUSTED_MANIFEST_SHA256>
 ```
 
 notebook은 CPU에서 네 variant를 모두 실행한다. CUDA가 실제로 사용 가능한 경우에만
@@ -151,8 +169,9 @@ runner에는 test split을 선택하는 CLI 인자가 없다. config의 stage �
 
 ## 7. output artifact schema
 
-각 실행 directory 이름은 owner, variant, train seed, split seed, device 및 필수 hash로
-계산한 deterministic experiment ID다. 다음 일곱 파일만 생성한다.
+각 실행 directory 이름은 owner, variant, train seed, split seed, device,
+data/split/split-config/preprocessing/configuration/Git hash로 계산한 deterministic
+experiment ID다. 다음 일곱 파일만 생성한다.
 
 | 파일 | 분류 | 내용 |
 | --- | --- | --- |

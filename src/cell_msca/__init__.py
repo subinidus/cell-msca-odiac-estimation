@@ -8,6 +8,7 @@ from .data import (
     CellDataset,
     FeatureMetadata,
     PreprocessingStats,
+    canonical_npz_content_sha256,
     fit_train_preprocessing,
 )
 from .evaluate import (
@@ -96,6 +97,7 @@ __all__ = [
     "build_split_subsets",
     "calculate_prediction_bootstrap_from_csv",
     "calculate_prediction_metrics_from_csv",
+    "canonical_npz_content_sha256",
     "ConcatMLPConfig",
     "create_frozen_baseline_selection",
     "duan_smearing_factor",

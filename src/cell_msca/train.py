@@ -36,7 +36,7 @@ from .target import inverse_target
 CELL_MSCA_CHECKPOINT_SCHEMA_VERSION = "cell_msca.selected_checkpoint.v1"
 GIT_DIRTY_STATE_POLICY = "tracked_and_untracked_files"
 ATTACHED_CODE_GIT_STATE_POLICY = (
-    "attached_code_dataset_exact_sha_file_no_worktree_status"
+    "attached_code_dataset_manifest_verified_no_git_worktree"
 )
 GIT_DIRTY_STATE_POLICIES = {
     GIT_DIRTY_STATE_POLICY,

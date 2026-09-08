@@ -44,8 +44,20 @@ KAGGLE_VALIDATION_SCHEMA_VERSION = "cell_msca.kaggle_validation.v1"
 KAGGLE_MANIFEST_SCHEMA_VERSION = "cell_msca.kaggle_run_manifest.v1"
 EXPERIMENT_ASSIGNMENT_SCHEMA_VERSION = "cell_msca.experiment_assignment.v1"
 SYNTHETIC_DATA_SCHEMA_VERSION = "cell_msca.synthetic_validation.v1"
+SOURCE_TREE_MANIFEST_SCHEMA_VERSION = "cell_msca.source_tree_manifest.v1"
+ATTACHED_SOURCE_POLICY = "attached_code_dataset_manifest_verified_no_git_worktree"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+SOURCE_MANIFEST_DIRECTORIES = ("src/cell_msca", "configs")
+SOURCE_MANIFEST_FILES = (
+    "notebooks/cell_msca_kaggle_validation.ipynb",
+    "pyproject.toml",
+    "requirements.txt",
+)
+SOURCE_MANIFEST_IGNORED_PARTS = {
+    "__pycache__",
+    ".ipynb_checkpoints",
+}
 FORBIDDEN_CONFIG_FIELDS = {
     "access_token",
     "api_key",
@@ -81,6 +93,8 @@ class GitIdentity:
     worktree_dirty: bool
     dirty_state_policy: str
     source: str
+    source_manifest_sha256: str | None = None
+    verified_source_file_count: int | None = None
 
     def __post_init__(self) -> None:
         commit = self.commit_sha.lower()
@@ -91,6 +105,19 @@ class GitIdentity:
             raise ValueError("Git dirty-state policy must not be empty")
         if not self.source:
             raise ValueError("Git identity source must not be empty")
+        if self.source == "attached_private_code_dataset":
+            manifest_sha256 = _validate_sha256(
+                self.source_manifest_sha256,
+                name="source_manifest_sha256",
+            )
+            object.__setattr__(self, "source_manifest_sha256", manifest_sha256)
+            if (
+                self.verified_source_file_count is None
+                or self.verified_source_file_count <= 0
+            ):
+                raise ValueError(
+                    "attached source identity requires verified source files"
+                )
 
 
 @dataclass(frozen=True)
@@ -189,6 +216,13 @@ def load_kaggle_validation_config(path: str | Path) -> dict[str, Any]:
         != SYNTHETIC_DATA_SCHEMA_VERSION
     ):
         raise ValueError("unsupported synthetic data schema version")
+    if (
+        data_mode == "synthetic"
+        and values["data"].get("data_hash_mode") != "canonical_npz_content"
+    ):
+        raise ValueError(
+            "synthetic data requires data_hash_mode='canonical_npz_content'"
+        )
     if not isinstance(values.get("split"), dict):
         raise ValueError("configuration requires a split object")
     required_hashes = values.get("required_hashes")
@@ -271,6 +305,7 @@ def deterministic_experiment_id(
     device: str,
     data_sha256: str,
     split_sha256: str,
+    split_config_sha256: str,
     preprocessing_sha256: str,
     configuration_sha256: str,
     git_commit_sha: str,
@@ -287,6 +322,10 @@ def deterministic_experiment_id(
         "device": str(device),
         "data_sha256": _validate_sha256(data_sha256, name="data_sha256"),
         "split_sha256": _validate_sha256(split_sha256, name="split_sha256"),
+        "split_config_sha256": _validate_sha256(
+            split_config_sha256,
+            name="split_config_sha256",
+        ),
         "preprocessing_sha256": _validate_sha256(
             preprocessing_sha256,
             name="preprocessing_sha256",
@@ -351,6 +390,167 @@ def validate_execution_paths(
         raise ValueError("data.mode must be 'synthetic' or 'npz'")
 
 
+def _source_manifest_paths(repository_root: Path) -> tuple[Path, ...]:
+    paths: set[Path] = set()
+    for relative_directory in SOURCE_MANIFEST_DIRECTORIES:
+        directory = repository_root / relative_directory
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"source manifest scope is missing directory: {relative_directory}"
+            )
+        for candidate in directory.rglob("*"):
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(repository_root)
+            if any(part in SOURCE_MANIFEST_IGNORED_PARTS for part in relative.parts):
+                continue
+            if candidate.suffix.lower() in {".pyc", ".pyo"}:
+                continue
+            if candidate.is_symlink():
+                raise ValueError(
+                    f"source manifest scope rejects symbolic links: {relative.as_posix()}"
+                )
+            paths.add(relative)
+    for relative_file in SOURCE_MANIFEST_FILES:
+        candidate = repository_root / relative_file
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"source manifest scope is missing file: {relative_file}"
+            )
+        if candidate.is_symlink():
+            raise ValueError(
+                f"source manifest scope rejects symbolic links: {relative_file}"
+            )
+        paths.add(Path(relative_file))
+    return tuple(sorted(paths, key=lambda value: value.as_posix()))
+
+
+def build_source_tree_manifest(
+    repository_root: str | Path,
+    *,
+    git_commit_sha: str,
+) -> dict[str, Any]:
+    """Build the attached-code integrity manifest for the frozen source scope."""
+
+    root = Path(repository_root).resolve()
+    commit = str(git_commit_sha).lower()
+    if not GIT_SHA_PATTERN.fullmatch(commit):
+        raise ValueError("git_commit_sha must be an exact Git commit SHA")
+    files = [
+        {
+            "path": relative.as_posix(),
+            "sha256": file_sha256(root / relative),
+        }
+        for relative in _source_manifest_paths(root)
+    ]
+    return {
+        "schema_version": SOURCE_TREE_MANIFEST_SCHEMA_VERSION,
+        "git_commit_sha": commit,
+        "scope": {
+            "directories": list(SOURCE_MANIFEST_DIRECTORIES),
+            "files": list(SOURCE_MANIFEST_FILES),
+        },
+        "files": files,
+    }
+
+
+def write_source_tree_manifest(
+    repository_root: str | Path,
+    destination: str | Path,
+    *,
+    git_commit_sha: str,
+) -> str:
+    """Write a source manifest without overwriting and return its file SHA-256."""
+
+    output = Path(destination)
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite source manifest: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    manifest = build_source_tree_manifest(
+        repository_root,
+        git_commit_sha=git_commit_sha,
+    )
+    _atomic_write_json(output, manifest)
+    return file_sha256(output)
+
+
+def verify_source_tree_manifest(
+    repository_root: str | Path,
+    manifest_path: str | Path,
+    *,
+    expected_git_sha: str,
+    expected_manifest_sha256: str,
+) -> int:
+    """Fail closed unless every required attached-source file matches its manifest."""
+
+    root = Path(repository_root).resolve()
+    path = Path(manifest_path)
+    expected_manifest = _validate_sha256(
+        expected_manifest_sha256,
+        name="expected_source_manifest_sha256",
+    )
+    if not path.is_file():
+        raise FileNotFoundError(f"attached source manifest is missing: {path}")
+    actual_manifest = file_sha256(path)
+    if actual_manifest != expected_manifest:
+        raise ValueError(
+            "attached source manifest SHA-256 mismatch: "
+            f"expected={expected_manifest}, actual={actual_manifest}"
+        )
+    with path.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if not isinstance(manifest, dict):
+        raise ValueError("attached source manifest root must be an object")
+    if manifest.get("schema_version") != SOURCE_TREE_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("unsupported attached source manifest schema_version")
+    expected_commit = str(expected_git_sha).lower()
+    if manifest.get("git_commit_sha") != expected_commit:
+        raise ValueError("attached source manifest Git SHA mismatch")
+    if manifest.get("scope") != {
+        "directories": list(SOURCE_MANIFEST_DIRECTORIES),
+        "files": list(SOURCE_MANIFEST_FILES),
+    }:
+        raise ValueError("attached source manifest scope does not match the runner contract")
+    entries = manifest.get("files")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("attached source manifest requires file entries")
+    recorded: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise ValueError(f"invalid attached source manifest entry at index {index}")
+        relative_text = str(entry["path"])
+        relative = PurePosixPath(relative_text)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative_text != relative.as_posix()
+        ):
+            raise ValueError(f"unsafe repository-relative manifest path: {relative_text!r}")
+        if relative_text in recorded:
+            raise ValueError(f"duplicate attached source manifest path: {relative_text}")
+        recorded[relative_text] = _validate_sha256(
+            entry["sha256"],
+            name=f"source manifest sha256[{relative_text}]",
+        )
+    actual_paths = {
+        relative.as_posix(): relative for relative in _source_manifest_paths(root)
+    }
+    if set(recorded) != set(actual_paths):
+        missing = sorted(set(actual_paths) - set(recorded))
+        unexpected = sorted(set(recorded) - set(actual_paths))
+        raise ValueError(
+            "attached source manifest coverage mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for relative_text, relative in actual_paths.items():
+        actual_sha256 = file_sha256(root / relative)
+        if actual_sha256 != recorded[relative_text]:
+            raise ValueError(
+                f"attached source file SHA-256 mismatch: {relative_text}"
+            )
+    return len(recorded)
+
+
 def collect_environment() -> dict[str, Any]:
     """Collect versions and fail clearly for incompatible required packages."""
 
@@ -399,37 +599,81 @@ def resolve_git_identity(
     *,
     expected_git_sha: str,
     source_git_sha_file: str | Path | None = None,
+    source_tree_manifest: str | Path | None = None,
+    expected_source_manifest_sha256: str | None = None,
 ) -> GitIdentity:
-    """Verify a clean checkout or an attached-code SHA declaration."""
+    """Verify a clean checkout or a manifest-bound attached source tree."""
 
     expected = str(expected_git_sha).lower()
     if not GIT_SHA_PATTERN.fullmatch(expected):
         raise ValueError("expected_git_sha must be an exact Git commit SHA")
-    try:
-        from .train import discover_git_state
-
-        commit, dirty = discover_git_state(repository_root)
-    except (FileNotFoundError, RuntimeError, OSError, subprocess.CalledProcessError):
-        if source_git_sha_file is None:
+    root = Path(repository_root).resolve()
+    attached_values = (
+        source_git_sha_file,
+        source_tree_manifest,
+        expected_source_manifest_sha256,
+    )
+    if any(value is not None for value in attached_values):
+        if any(value is None for value in attached_values):
             raise RuntimeError(
-                "Git metadata is unavailable; an attached private code dataset must "
-                "provide --source-git-sha-file"
+                "attached code requires --source-git-sha-file, "
+                "--source-tree-manifest, and --expected-source-manifest-sha256"
             )
+        assert source_git_sha_file is not None
+        assert source_tree_manifest is not None
+        assert expected_source_manifest_sha256 is not None
         declaration = Path(source_git_sha_file)
+        if not declaration.is_file():
+            raise FileNotFoundError(
+                f"attached source Git SHA declaration is missing: {declaration}"
+            )
         commit = declaration.read_text(encoding="utf-8").strip().lower()
         if not GIT_SHA_PATTERN.fullmatch(commit):
             raise ValueError("source Git SHA file does not contain an exact commit SHA")
-        dirty = False
+        if commit != expected:
+            raise ValueError(
+                f"Git SHA mismatch: expected={expected}, declared={commit}"
+            )
+        verified_file_count = verify_source_tree_manifest(
+            root,
+            source_tree_manifest,
+            expected_git_sha=commit,
+            expected_manifest_sha256=expected_source_manifest_sha256,
+        )
         identity = GitIdentity(
             commit,
-            dirty,
-            "attached_code_dataset_exact_sha_file_no_worktree_status",
+            False,
+            ATTACHED_SOURCE_POLICY,
             "attached_private_code_dataset",
+            source_manifest_sha256=expected_source_manifest_sha256.lower(),
+            verified_source_file_count=verified_file_count,
         )
     else:
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip().lower()
+            status = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (FileNotFoundError, OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(
+                "Git metadata is unavailable; attached code requires a verified "
+                "source manifest"
+            ) from error
+        if not GIT_SHA_PATTERN.fullmatch(commit):
+            raise RuntimeError("git rev-parse returned an invalid commit SHA")
         identity = GitIdentity(
             commit,
-            bool(dirty),
+            bool(status.strip()),
             "tracked_and_untracked_files",
             "git_checkout",
         )
@@ -503,7 +747,11 @@ def _synthetic_tuning_data(
         path = data_dir / f"month_{month_index:02d}.npz"
         _write_synthetic_month(path, month_index=month_index)
         paths.append(path)
-    dataset = CellDataset(paths, target_scale=target_scale)
+    dataset = CellDataset(
+        paths,
+        target_scale=target_scale,
+        data_hash_mode="canonical_npz_content",
+    )
     split_csv = directory / "synthetic_split.csv"
     split_metadata = directory / "synthetic_split.metadata.json"
     create_persistent_cell_fixed_split(
@@ -540,6 +788,7 @@ def _npz_tuning_data(
         target_scale=float(data_values.get("target_scale", 1.0)),
         legacy_data_version=data_values.get("legacy_data_version"),
         legacy_target_unit=data_values.get("legacy_target_unit"),
+        data_hash_mode=str(data_values.get("data_hash_mode", "file_bytes")),
     )
     project_root = (config_path.parent / values.get("project_root", "..")).resolve()
     split_values = values["split"]
@@ -642,6 +891,8 @@ def run_kaggle_validation(
     expected_git_sha: str,
     kaggle: bool = False,
     source_git_sha_file: str | Path | None = None,
+    source_tree_manifest: str | Path | None = None,
+    expected_source_manifest_sha256: str | None = None,
     repository_root: str | Path | None = None,
     git_identity: GitIdentity | None = None,
 ) -> ValidationRunArtifacts:
@@ -669,6 +920,8 @@ def run_kaggle_validation(
         root,
         expected_git_sha=expected_git_sha,
         source_git_sha_file=source_git_sha_file,
+        source_tree_manifest=source_tree_manifest,
+        expected_source_manifest_sha256=expected_source_manifest_sha256,
     )
     if identity.commit_sha != str(expected_git_sha).lower():
         raise ValueError("injected Git identity does not match expected_git_sha")
@@ -712,6 +965,7 @@ def run_kaggle_validation(
         device=device,
         data_sha256=expected_hashes["data_sha256"],
         split_sha256=expected_hashes["split_sha256"],
+        split_config_sha256=expected_hashes["split_config_sha256"],
         preprocessing_sha256=expected_hashes["preprocessing_sha256"],
         configuration_sha256=configuration_sha256,
         git_commit_sha=identity.commit_sha,
@@ -757,6 +1011,8 @@ def run_kaggle_validation(
         "git_identity_source": identity.source,
         "git_dirty_state_policy": identity.dirty_state_policy,
         "git_worktree_dirty": identity.worktree_dirty,
+        "source_manifest_sha256": identity.source_manifest_sha256,
+        "verified_source_file_count": identity.verified_source_file_count,
         "runtime_versions": {
             "python": environment["python"],
             "pytorch": environment["pytorch"],
@@ -921,6 +1177,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", required=True, choices=("cpu", "cuda", "auto"))
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--source-git-sha-file", type=Path)
+    parser.add_argument("--source-tree-manifest", type=Path)
+    parser.add_argument("--expected-source-manifest-sha256")
     parser.add_argument("--repository-root", type=Path)
     parser.add_argument("--kaggle", action="store_true")
     arguments = parser.parse_args(argv)
@@ -934,6 +1192,10 @@ def main(argv: list[str] | None = None) -> int:
         expected_git_sha=arguments.expected_git_sha,
         kaggle=arguments.kaggle,
         source_git_sha_file=arguments.source_git_sha_file,
+        source_tree_manifest=arguments.source_tree_manifest,
+        expected_source_manifest_sha256=(
+            arguments.expected_source_manifest_sha256
+        ),
         repository_root=arguments.repository_root,
     )
     print(
