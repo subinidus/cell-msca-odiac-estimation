@@ -1,0 +1,391 @@
+{
+  "schema_version": "cell_msca.v1_legacy_archive_manifest.v1",
+  "artifact_classification": "engineering-only-input-integrity",
+  "data_version": "v1_legacy",
+  "target_definition": "v1_legacy ODIAC-derived zonal mean: arithmetic mean of ODIAC source-pixel values selected by the legacy all_touched zonal operation",
+  "target_claim_exclusions": [
+    "not a verified target-cell total",
+    "not a direct emissions measurement",
+    "not a mass-conserving target",
+    "physical unit remains unresolved"
+  ],
+  "known_preprocessing_limitation": "The archived features already include upstream month-wide whole-grid missing-value imputation performed before the persistent split. Current train-only preprocessing cannot reverse that operation.",
+  "archive": {
+    "file_name": "2022_2024_npz.zip",
+    "size_bytes": 11382106,
+    "file_sha256": "5e01b3bc58fa2adebbe24aa2b6c3d2d2b93d274adc1c2686a37c62f57a5d93ed",
+    "expected_npz_count": 36,
+    "month_start": "2022-01",
+    "month_end": "2024-12"
+  },
+  "npz_contract": {
+    "keys": [
+      "stream_a",
+      "stream_b",
+      "label_cls",
+      "label_reg",
+      "mask",
+      "stream_a_features",
+      "stream_b_features",
+      "date",
+      "region",
+      "height",
+      "width"
+    ],
+    "arrays": {
+      "stream_a": {
+        "shape": [
+          3,
+          136,
+          130
+        ],
+        "dtype": "float32",
+        "nonfinite_count_per_file": 0
+      },
+      "stream_b": {
+        "shape": [
+          4,
+          136,
+          130
+        ],
+        "dtype": "float32",
+        "nonfinite_count_per_file": 0
+      },
+      "label_reg": {
+        "shape": [
+          136,
+          130
+        ],
+        "dtype": "float32",
+        "nonfinite_count_per_file": 0
+      },
+      "label_cls": {
+        "shape": [
+          136,
+          130
+        ],
+        "dtype": "int64",
+        "nonfinite_count_per_file": 0,
+        "model_input": false
+      },
+      "mask": {
+        "shape": [
+          136,
+          130
+        ],
+        "dtype": "uint8",
+        "nonfinite_count_per_file": 0
+      }
+    },
+    "stream_a_feature_order": [
+      "no2_mean",
+      "so2_mean",
+      "co_mean"
+    ],
+    "stream_b_feature_order": [
+      "nightlight_mean",
+      "urban_fraction",
+      "power_plant_count",
+      "fossil_capacity_mw"
+    ],
+    "same_mask_all_months": true,
+    "valid_cells_per_month": 17157,
+    "invalid_cells_per_month": 523,
+    "all_numeric_arrays_finite": true
+  },
+  "data_contract": {
+    "data_version": "v1_legacy",
+    "target_unit": "ODIAC native value; exact target-cell interpretation unverified",
+    "target_scale": 1.0,
+    "data_hash_mode": "file_bytes",
+    "sample_count": 617652,
+    "target_min": 0.0,
+    "target_max": 94549.625,
+    "target_mean": 152.33341551644273,
+    "target_zero_count": 4644,
+    "target_negative_count": 0
+  },
+  "split_contract": {
+    "csv": "splits/cell_fixed_seed42.csv",
+    "metadata_json": "splits/cell_fixed_seed42.metadata.v2.json",
+    "split_seed": 42,
+    "validation_ratio": 0.15,
+    "test_ratio": 0.15,
+    "cell_counts": {
+      "train": 12009,
+      "validation": 2574,
+      "test": 2574
+    },
+    "sample_counts": {
+      "train": 432324,
+      "validation": 92664,
+      "test": 92664
+    }
+  },
+  "train_seed": 42,
+  "required_hashes": {
+    "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+    "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+    "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+    "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db"
+  },
+  "test_gate": {
+    "assignment_integrity_verified": true,
+    "sample_arrays_materialized": false,
+    "evaluation_performed": false
+  },
+  "files": [
+    {
+      "month_id": "2022-01",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_01.npz",
+      "size_bytes": 319295,
+      "file_sha256": "8d69aa53dc405c7e507ec8f925190a931ee9dcf33c629b7180b035366054950a",
+      "canonical_content_sha256": "9db1e1fddaf689df830e2b08984edd846f0113bad1582ba6baad76aa90fc403c"
+    },
+    {
+      "month_id": "2022-02",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_02.npz",
+      "size_bytes": 317616,
+      "file_sha256": "d98a20438b4cd796510fdfa3f0dfe8d912d976b100f8ed3b8d001e2926662f66",
+      "canonical_content_sha256": "267b714cb3a9c028adc1d087d076a38875a2e2b7b6310576b2daed529c2e0cd6"
+    },
+    {
+      "month_id": "2022-03",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_03.npz",
+      "size_bytes": 317355,
+      "file_sha256": "dfbff60f228e51e9fd7c55e5e451ccf5fda28df64b23361922347c0ab9f02632",
+      "canonical_content_sha256": "74904b62d453cca06396aedae4afbcf7fdfa067d0881e4257c459dd98852b69e"
+    },
+    {
+      "month_id": "2022-04",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_04.npz",
+      "size_bytes": 316421,
+      "file_sha256": "221d1a0dab7c6cc470a147b417aa6a96616d8456f399e8a653fb884141713f70",
+      "canonical_content_sha256": "862bec883c1dec6fd7f1de7e942661c33f654b2c1b6ce193672f6b41523ac8ce"
+    },
+    {
+      "month_id": "2022-05",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_05.npz",
+      "size_bytes": 316459,
+      "file_sha256": "fcbb6ace94bee20e25547a97b775589fcd0e721ba2ed5f9fb7b2f7266f7ccee0",
+      "canonical_content_sha256": "edd6beb9aaeaf99d34644b261c8e7138fd4a06dbd301a11051db22e4caa7a409"
+    },
+    {
+      "month_id": "2022-06",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_06.npz",
+      "size_bytes": 315462,
+      "file_sha256": "924714383aa591cae6c926d0d6bda36870d8203f2d9dcdea74e5f03214af491b",
+      "canonical_content_sha256": "5f824513687326ede365c59d5c3e1acbd9e45d3969c46d82821c48237b020fcc"
+    },
+    {
+      "month_id": "2022-07",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_07.npz",
+      "size_bytes": 304349,
+      "file_sha256": "db16f1c961a17136d52651f062f6a737ec7b77f392866063fc481f8bce3dbc94",
+      "canonical_content_sha256": "d0434e6500b85dd109698603e1cfe154d7203be145106e50c2d06cf69caebe11"
+    },
+    {
+      "month_id": "2022-08",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_08.npz",
+      "size_bytes": 317700,
+      "file_sha256": "4f0cb21191be83acc3a866602ab2d0fecfb47bc2fc596b540520baa9c6d37d9e",
+      "canonical_content_sha256": "e021476f00339215ddce8b726d332faf1a797fd3481bb3994e3b48982ca22a25"
+    },
+    {
+      "month_id": "2022-09",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_09.npz",
+      "size_bytes": 316946,
+      "file_sha256": "8e75ed77c981a911ba4dccdb13246d2019e8c4d8fbf787f801ce9a3ad38adce7",
+      "canonical_content_sha256": "01cdc39c42ac47008ab08c49262b318f3d676c8f122cb112cd3a2a311062d31a"
+    },
+    {
+      "month_id": "2022-10",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_10.npz",
+      "size_bytes": 318579,
+      "file_sha256": "3eaebdbc5304f2511456581b52b7d7e218f7f0756f60ba31a6c9a3ebcf5cd29a",
+      "canonical_content_sha256": "27ea924bc85f286aeb92c5d07c87c2b4b38d5ce9868e7eb72d928432f6205e56"
+    },
+    {
+      "month_id": "2022-11",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_11.npz",
+      "size_bytes": 317948,
+      "file_sha256": "ec2d796c400e3b7786848aff0b72a1219ae3fd2b9f1663782628ee00bfc20aa6",
+      "canonical_content_sha256": "a0d9c63d0af698dec9bfc7e58f8caeff5ea3ede8e406e73048a51ac872fc39a4"
+    },
+    {
+      "month_id": "2022-12",
+      "file_name": "ms_mca_tensor_delhi_ncr_2022_12.npz",
+      "size_bytes": 317053,
+      "file_sha256": "7d0af017c13ff3150313ed6c9521383b823b63fa9863fc0d0e141374442f7c94",
+      "canonical_content_sha256": "50e578e0904c03bb4de45982a8efb2739aa690f20d41c494ba02c4fce4e0e2d7"
+    },
+    {
+      "month_id": "2023-01",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_01.npz",
+      "size_bytes": 318825,
+      "file_sha256": "4cd944c78d4966406631b2a73d8f6ed3db3ea241abd7b02935980b6e82cd570d",
+      "canonical_content_sha256": "6acceffd7642f8b71861228791f8681e711bafee90683bfee84af9b209896a93"
+    },
+    {
+      "month_id": "2023-02",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_02.npz",
+      "size_bytes": 317818,
+      "file_sha256": "95338954b87b350b435cd38695d84ef117b41f12de798905292d29485829d359",
+      "canonical_content_sha256": "543a00deafb1ffc5cf41489b51b79721cbdcdc5b2b5d9fe09b209072e683c171"
+    },
+    {
+      "month_id": "2023-03",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_03.npz",
+      "size_bytes": 317720,
+      "file_sha256": "39df28301e8e4b42ea31ac213df90ca405f6545f56448b0836924fe72f615a69",
+      "canonical_content_sha256": "1213426c0b7b51883123bf664b4122613dfce4f63963dfa404fd54a3382fd0d8"
+    },
+    {
+      "month_id": "2023-04",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_04.npz",
+      "size_bytes": 316128,
+      "file_sha256": "1151e3d78377edd8d84a27fefd158ee4b3c6979be7e7c9e3417e2b46cee5e14b",
+      "canonical_content_sha256": "d7c19005752e998312e8c466e84353113a721ee38bee4320f77c19420c96c991"
+    },
+    {
+      "month_id": "2023-05",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_05.npz",
+      "size_bytes": 315428,
+      "file_sha256": "5498711dd1a41494f09a425b67f6baf990c3997c53d2a713801673225dac4418",
+      "canonical_content_sha256": "27bb759c7142a31f156eb65e4c6db5b55be4cc25461b7e0ede02518d32981f3d"
+    },
+    {
+      "month_id": "2023-06",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_06.npz",
+      "size_bytes": 316637,
+      "file_sha256": "4b58684fa1cba14fabfa17db8e494f69a7883fb05adb4f8af61f7a7263843434",
+      "canonical_content_sha256": "c244890e499237a1348aa9beb6ebd8d128f1f2a2d986c1e5636c7e29c12b320d"
+    },
+    {
+      "month_id": "2023-07",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_07.npz",
+      "size_bytes": 318185,
+      "file_sha256": "2621899ca45cfc46c7853ee137101bdf2d9c9dced0a02bbb8acfa16b037d7070",
+      "canonical_content_sha256": "635e7f0c7ea7923f9cc7c487f3b4846d458a7bcc830282a4e229e7fa2f20dfb7"
+    },
+    {
+      "month_id": "2023-08",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_08.npz",
+      "size_bytes": 318355,
+      "file_sha256": "ca686537ae9f64f2315dda12b5a4689312d8c1e3a1f64cd17a7fdeefb0b6beb7",
+      "canonical_content_sha256": "8bba2a478f7cf6d27694fb5101f817bac7d08a1a7f6384fe8d36ff23bf3d58a3"
+    },
+    {
+      "month_id": "2023-09",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_09.npz",
+      "size_bytes": 316500,
+      "file_sha256": "4144665d0097838c47859532092c2a2750a1dee75dd2464732d716654c3a668e",
+      "canonical_content_sha256": "55b0408b2f31047b2c471fa3f594877ba56c03c0a3b9def7568ecd7c14d37242"
+    },
+    {
+      "month_id": "2023-10",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_10.npz",
+      "size_bytes": 317109,
+      "file_sha256": "7ba259703872d6bbf5751113cc36ec8a02d6b1a01355aced78c1ca88f4a82fca",
+      "canonical_content_sha256": "7f158bce8dac91f2863b48ca49676a5aebd3dadf837f645e8a9e069d7c035c8c"
+    },
+    {
+      "month_id": "2023-11",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_11.npz",
+      "size_bytes": 319379,
+      "file_sha256": "d616d28be1141ed5f756688cb94110efc5f2118222995f302d7771eeaf540f62",
+      "canonical_content_sha256": "2f250c83dc88d5a5247aaad9ed7f8e73159e8a2d94a1a0bfc45c5f7f04fb4469"
+    },
+    {
+      "month_id": "2023-12",
+      "file_name": "ms_mca_tensor_delhi_ncr_2023_12.npz",
+      "size_bytes": 317281,
+      "file_sha256": "bb0884377d08baa626d8f267300c91fc88ab00285253adbe760b898f769567f5",
+      "canonical_content_sha256": "15a8ee92e021eb2e22c0c63161aa0c74562daedaddf06954d192ec53814c207d"
+    },
+    {
+      "month_id": "2024-01",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_01.npz",
+      "size_bytes": 318964,
+      "file_sha256": "b2ca54eac31ca041d47cb918a14f69895178053b45582193e2ffbc4f08c46bff",
+      "canonical_content_sha256": "c7019fecf45d6a1232d2ce423e3c573d01b89d6217c5b9a669e7632e1b11e01c"
+    },
+    {
+      "month_id": "2024-02",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_02.npz",
+      "size_bytes": 317961,
+      "file_sha256": "a11e7ab8fcbc3389ef58a8c261ab9f26b6fda9d6471ca4bf25ef964b5a4e544c",
+      "canonical_content_sha256": "9d96e3c35aba11750f96e7762fbbb3eabac72ef709a9e6c86afaaee7ca327399"
+    },
+    {
+      "month_id": "2024-03",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_03.npz",
+      "size_bytes": 316506,
+      "file_sha256": "c3d742c6facd0f237d11d3a52e2d0be71e752e576443dc22afc744479dc6cfbc",
+      "canonical_content_sha256": "1f9ef96e386736e33179856b8ae03a8fdbe77055d8ff7bd3ff24041c2719ae77"
+    },
+    {
+      "month_id": "2024-04",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_04.npz",
+      "size_bytes": 316610,
+      "file_sha256": "2c80f23a7dbd362db6b5ba7daa41d430dd9eca161ed885ffee844b0984c4a3c4",
+      "canonical_content_sha256": "eace4250aefbaee94477180109fe2a8af43177b1cd6d97b19d6cb8b93869755e"
+    },
+    {
+      "month_id": "2024-05",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_05.npz",
+      "size_bytes": 316093,
+      "file_sha256": "a7b9c9a8bef010d289fda91e5535caae4fb499ba6601c98fb2dbe05e190a2be4",
+      "canonical_content_sha256": "b76792bef38b2f4aad61eeb703bc8adde198d30e7db2fd5706b796e6ca831f64"
+    },
+    {
+      "month_id": "2024-06",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_06.npz",
+      "size_bytes": 317238,
+      "file_sha256": "71af492e4da54254812b12233b3ee9ef3c913a200e34ff3a83efa382925b5c62",
+      "canonical_content_sha256": "bd2738ea5c1bb7f498049a9b6a9b9b5e564f64f2288be5447f2b413421cadaf9"
+    },
+    {
+      "month_id": "2024-07",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_07.npz",
+      "size_bytes": 317891,
+      "file_sha256": "68b1b471a2a67fb8ddf663e4c1173d6fcce5c2e412a4c70198b4fa66fe4d199d",
+      "canonical_content_sha256": "3ec5cd7c956a30b43a145b2d491fdd0444df312d52868430b6c8f63a83dc354f"
+    },
+    {
+      "month_id": "2024-08",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_08.npz",
+      "size_bytes": 319021,
+      "file_sha256": "5ab2d70fa4859b00d7c31f5c9f39b4aadc4df1ca77afe4c5b5ca396c03f295e6",
+      "canonical_content_sha256": "3975c925f4d607ca1c1a5e6a97bda76fa578ac304202a7406b0b2079e5de1697"
+    },
+    {
+      "month_id": "2024-09",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_09.npz",
+      "size_bytes": 317602,
+      "file_sha256": "11ffbabf006476a9cb11eb5eab29c199bf9efb883ceb1c5db6979900799c4dee",
+      "canonical_content_sha256": "ea2b75b477e243991f0df2a5017fcce2c07db03f5f294297da1dfc410f9c6d49"
+    },
+    {
+      "month_id": "2024-10",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_10.npz",
+      "size_bytes": 317392,
+      "file_sha256": "6f944199b9f8e7502430216593e6a8edaa8e131f5b3b2884f609b06ae77c244d",
+      "canonical_content_sha256": "b59c1ccdc1f4c55e2d35d1f98bf04f9cf4cc61675932d6bb3ae1746cca985635"
+    },
+    {
+      "month_id": "2024-11",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_11.npz",
+      "size_bytes": 318890,
+      "file_sha256": "9e39a274a9596606e632d2582e1b10a8c86194e4eeec660d84adc13ba240abb2",
+      "canonical_content_sha256": "f6ed4f110bca1ab2629648ff7e94743db115a7d7163a1a0a6c40937e94297620"
+    },
+    {
+      "month_id": "2024-12",
+      "file_name": "ms_mca_tensor_delhi_ncr_2024_12.npz",
+      "size_bytes": 317812,
+      "file_sha256": "c8391b90fe12d64f7e4aa5f3627d5fe72b3470e31eacb428bcbd6747524cf7cc",
+      "canonical_content_sha256": "ac34e23b273a3bc5cc1f40a7b280b787ccb8ac1d5b92bb529f93d49280b65fad"
+    }
+  ]
+}

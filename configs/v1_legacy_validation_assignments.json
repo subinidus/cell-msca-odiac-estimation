@@ -1,0 +1,117 @@
+{
+  "schema_version": "cell_msca.experiment_assignment.v1",
+  "hyperparameter_policy": "frozen_no_independent_changes",
+  "instructions": "Owners execute only the frozen configuration and exact Git commit approved after this package is merged. Test access, independent hyperparameter changes, and output reuse are prohibited.",
+  "assignments": [
+    {
+      "owner": "assign-cpu-owner",
+      "experiment_id": "train_mean_seed42",
+      "model_family": "baseline",
+      "variant": "train_mean",
+      "loss": "mean_original_target",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/train_mean_seed42",
+      "notes": "CPU; existing Phase 3 fit/evaluator through the thin v1 adapter."
+    },
+    {
+      "owner": "assign-cpu-owner",
+      "experiment_id": "lightgbm_raw_seed42",
+      "model_family": "baseline",
+      "variant": "lightgbm_raw",
+      "loss": "regression_l1_on_original_target",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/lightgbm_raw_seed42",
+      "notes": "CPU; LightGBM early stopping receives validation only."
+    },
+    {
+      "owner": "assign-cpu-owner",
+      "experiment_id": "lightgbm_log1p_seed42",
+      "model_family": "baseline",
+      "variant": "lightgbm_log1p",
+      "loss": "regression_l1_on_log1p_target",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/lightgbm_log1p_seed42",
+      "notes": "CPU; median/Duan selection uses validation after train-residual-only smearing."
+    },
+    {
+      "owner": "assign-cpu-owner",
+      "experiment_id": "lightgbm_tweedie_seed42",
+      "model_family": "baseline",
+      "variant": "lightgbm_tweedie",
+      "loss": "tweedie_on_original_target",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/lightgbm_tweedie_seed42",
+      "notes": "CPU; inverse_mode remains none."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "concat_mlp_raw_huber_seed42",
+      "model_family": "baseline",
+      "variant": "concat_mlp_raw_huber",
+      "loss": "raw_huber",
+      "seed": 42,
+      "status": "unsupported",
+      "output_location": "/kaggle/working/v1-legacy-validation/unsupported-concat-mlp-raw-huber",
+      "notes": "Unsupported: the reviewed Concat-MLP implements only log_l1 and log_huber on log1p targets. No raw-target variant was invented."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "concat_mlp_log1p_seed42",
+      "model_family": "baseline",
+      "variant": "concat_mlp_log1p",
+      "loss": "log_huber",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/concat_mlp_log1p_seed42",
+      "notes": "GPU; existing Phase 3 neural trainer through the thin v1 adapter."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "token_no_attention_seed42",
+      "model_family": "cell_msca",
+      "variant": "token_no_attention",
+      "loss": "log_huber",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/token_no_attention_seed42",
+      "notes": "GPU; Phase 4.3 runner, no cross-attention."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "cell_msca_forward_seed42",
+      "model_family": "cell_msca",
+      "variant": "forward",
+      "loss": "log_huber",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/cell_msca_forward_seed42",
+      "notes": "GPU; Q=socio-infrastructure and K/V=pollution/environment."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "cell_msca_reverse_seed42",
+      "model_family": "cell_msca",
+      "variant": "reverse",
+      "loss": "log_huber",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/cell_msca_reverse_seed42",
+      "notes": "GPU; Q=pollution/environment and K/V=socio-infrastructure."
+    },
+    {
+      "owner": "assign-gpu-owner",
+      "experiment_id": "cell_msca_bidirectional_seed42",
+      "model_family": "cell_msca",
+      "variant": "bidirectional",
+      "loss": "log_huber",
+      "seed": 42,
+      "status": "frozen_ready",
+      "output_location": "/kaggle/working/v1-legacy-validation/cell_msca_bidirectional_seed42",
+      "notes": "GPU; both directional cross-attention blocks."
+    }
+  ]
+}

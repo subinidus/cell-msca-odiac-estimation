@@ -1,0 +1,45 @@
+{
+  "schema_version": "cell_msca.v1_legacy_validation_package_manifest.v1",
+  "artifact_classification": "validation-only",
+  "status": "replace-at-runtime",
+  "owner": "replace-with-assigned-owner",
+  "experiment_id": "replace-with-frozen-assignment-id",
+  "model_family": "replace-with-baseline-or-cell_msca",
+  "variant": "replace-with-frozen-variant",
+  "data_version": "v1_legacy",
+  "target_definition": "v1_legacy ODIAC-derived zonal mean",
+  "target_unit": "ODIAC native value; exact target-cell interpretation unverified",
+  "archive_file_sha256": "5e01b3bc58fa2adebbe24aa2b6c3d2d2b93d274adc1c2686a37c62f57a5d93ed",
+  "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+  "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+  "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+  "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
+  "configuration_sha256": "replace-with-runtime-verified-sha256",
+  "git_commit_sha": "replace-with-exact-runtime-commit-sha",
+  "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
+  "split_seed": 42,
+  "train_seed": 42,
+  "allowed_materialized_splits": [
+    "train",
+    "validation"
+  ],
+  "test_subset_materialized": false,
+  "test_evaluation_performed": false,
+  "selection_metric": "validation original-unit MAE",
+  "headline_metrics": [
+    "original-unit MAE",
+    "original-unit RMSE",
+    "original-unit R2"
+  ],
+  "secondary_metrics": [
+    "log-space metrics",
+    "Spearman"
+  ],
+  "known_data_limitation": "Upstream month-wide whole-grid missing-value imputation is embedded in the archive.",
+  "runtime_versions": {
+    "python": "replace-at-runtime",
+    "numpy": "replace-at-runtime",
+    "pytorch": "replace-at-runtime",
+    "lightgbm": "replace-at-runtime"
+  }
+}
