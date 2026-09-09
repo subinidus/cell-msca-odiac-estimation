@@ -1,0 +1,57 @@
+{
+  "schema_version": "cell_msca.kaggle_validation.v1",
+  "stage": "validation_only",
+  "allowed_materialized_splits": [
+    "train",
+    "validation"
+  ],
+  "owner": "engineering-smoke",
+  "model_family": "cell_msca",
+  "frozen_train_seed": 3407,
+  "data": {
+    "mode": "synthetic",
+    "synthetic_schema_version": "cell_msca.synthetic_validation.v1",
+    "data_hash_mode": "canonical_npz_content",
+    "target_scale": 1.0
+  },
+  "split": {
+    "split_seed": 42,
+    "validation_ratio": 0.2,
+    "test_ratio": 0.2
+  },
+  "training": {
+    "architecture": {
+      "d_model": 8,
+      "num_heads": 2,
+      "encoder_layers": 1,
+      "ffn_multiplier": 2,
+      "head_hidden": 8,
+      "dropout": 0.0,
+      "attention_dropout": 0.0
+    },
+    "loss": "log_huber",
+    "huber_delta": 1.0,
+    "learning_rate": 0.001,
+    "batch_size": 8,
+    "max_epochs": 2,
+    "patience": 2,
+    "min_delta": 0.0,
+    "weight_decay": 0.00001
+  },
+  "required_hashes": {
+    "data_sha256": "ee78d9c10f803229591adfeaaa600fdfb2186570a6a60cd46e4614fd0f740bfe",
+    "split_sha256": "51c630370909a39659a369379b79f605550734a68869527191fec9c0548ded3a",
+    "split_config_sha256": "eee79ad53fe4ff868668f377d1e66ea9e273ebb3c17838d3f88356e28a3c7ee1",
+    "preprocessing_sha256": "9f7225aaf157519c004516a4a48a147a636200e221c092162409dd53294000a3",
+    "configuration_sha256_by_variant_and_device": {
+      "token_no_attention:cpu": "3df0272f1b31d4a90d5147c64fc62c93ad923de66a376e1c28e99aae003a6051",
+      "token_no_attention:cuda": "7aae1d551ebfa46a97a23e73ebae898b130360479516bf10db509554a3578814",
+      "forward:cpu": "bfc7a3205aea25d680a2660b9f54ce4ccba57e598035aa72e53262aba964f05f",
+      "forward:cuda": "763afba537acc215f25696e24eb2a653fd41da5aebe6e4f7fe26cbe6086017fa",
+      "reverse:cpu": "396ab0ac3dc03658c355c94701e643421e609a2bf735468920d624e75c557bf0",
+      "reverse:cuda": "3804a2d793e24353b6884f4aab22c2fc5fb787cd8e06973e5b7d064cba75afe9",
+      "bidirectional:cpu": "701a609d36616f4a63b07f970b53420453b8d65cbc72e150bafa42648cdbe8ae",
+      "bidirectional:cuda": "08c12b783d049f8e99222a866c678027a03ca2a4d0e5f0e5dad4c92912bd585f"
+    }
+  }
+}

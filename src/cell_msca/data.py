@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,8 @@ MODEL_SAMPLE_KEYS = {
 }
 
 PREPROCESSING_SCHEMA_VERSION = "cell_msca.preprocessing.v2"
+DATA_HASH_MODES = {"file_bytes", "canonical_npz_content"}
+NPZ_CONTENT_HASH_SCHEMA_VERSION = "cell_msca.npz_content.v1"
 
 
 def canonical_sha256(value: Any) -> str:
@@ -70,6 +73,109 @@ def file_sha256(path: str | Path) -> str:
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _update_length_prefixed(
+    digest: Any,
+    *,
+    name: str,
+    payload: bytes,
+) -> None:
+    """Add one named field with unambiguous little-endian length prefixes."""
+
+    name_bytes = name.encode("utf-8")
+    digest.update(struct.pack("<Q", len(name_bytes)))
+    digest.update(name_bytes)
+    digest.update(struct.pack("<Q", len(payload)))
+    digest.update(payload)
+
+
+def _canonical_array_bytes(array: NDArray[Any]) -> tuple[str, str, bytes]:
+    dtype = array.dtype
+    if dtype.hasobject:
+        raise ValueError("canonical NPZ content hashing rejects object dtype arrays")
+    if dtype.fields is not None:
+        raise ValueError("canonical NPZ content hashing rejects structured dtype arrays")
+
+    if dtype.byteorder == "|":
+        canonical_dtype = dtype
+        byte_order = "not-applicable"
+    else:
+        canonical_dtype = dtype.newbyteorder("<")
+        byte_order = "little-endian"
+    canonical = np.array(array, dtype=canonical_dtype, order="C", copy=True)
+    return canonical_dtype.str, byte_order, canonical.tobytes(order="C")
+
+
+def canonical_npz_content_sha256(path: str | Path) -> str:
+    """Hash logical NPZ array content independently of ZIP serialization.
+
+    Array keys are sorted. Every key, shape, canonical dtype, byte-order label,
+    and C-contiguous value byte sequence is length-delimited before hashing.
+    Numeric and other endian-aware dtypes are normalized to little-endian.
+    Pickled object arrays are never loaded.
+    """
+
+    digest = hashlib.sha256()
+    _update_length_prefixed(
+        digest,
+        name="schema_version",
+        payload=NPZ_CONTENT_HASH_SCHEMA_VERSION.encode("utf-8"),
+    )
+    try:
+        with np.load(Path(path), allow_pickle=False) as archive:
+            keys = sorted(archive.files)
+            if len(keys) != len(set(keys)):
+                raise ValueError("canonical NPZ content hashing rejects duplicate keys")
+            _update_length_prefixed(
+                digest,
+                name="array_count",
+                payload=struct.pack("<Q", len(keys)),
+            )
+            for index, key in enumerate(keys):
+                try:
+                    array = np.asarray(archive[key])
+                except ValueError as error:
+                    if "Object arrays cannot be loaded" in str(error):
+                        raise ValueError(
+                            "canonical NPZ content hashing rejects object dtype arrays"
+                        ) from error
+                    raise
+                dtype_text, byte_order, value_bytes = _canonical_array_bytes(array)
+                prefix = f"array[{index}]"
+                _update_length_prefixed(
+                    digest,
+                    name=f"{prefix}.key",
+                    payload=key.encode("utf-8"),
+                )
+                _update_length_prefixed(
+                    digest,
+                    name=f"{prefix}.shape",
+                    payload=json.dumps(
+                        list(array.shape),
+                        separators=(",", ":"),
+                    ).encode("ascii"),
+                )
+                _update_length_prefixed(
+                    digest,
+                    name=f"{prefix}.dtype",
+                    payload=dtype_text.encode("ascii"),
+                )
+                _update_length_prefixed(
+                    digest,
+                    name=f"{prefix}.byte_order",
+                    payload=byte_order.encode("ascii"),
+                )
+                _update_length_prefixed(
+                    digest,
+                    name=f"{prefix}.values_c_contiguous",
+                    payload=value_bytes,
+                )
+    except ValueError:
+        raise
+    except (OSError, EOFError) as error:
+        raise ValueError(f"cannot read NPZ content for canonical hashing: {path}") from error
     return digest.hexdigest()
 
 
@@ -330,6 +436,7 @@ class CellDataset:
         preprocessing_split_name: str = "train",
         legacy_data_version: str | None = None,
         legacy_target_unit: str | None = None,
+        data_hash_mode: str = "file_bytes",
     ) -> None:
         if not npz_paths:
             raise ValueError("npz_paths must not be empty")
@@ -345,6 +452,9 @@ class CellDataset:
             )
         self.legacy_data_version = legacy_data_version
         self.legacy_target_unit = legacy_target_unit
+        if data_hash_mode not in DATA_HASH_MODES:
+            raise ValueError(f"data_hash_mode must be one of {sorted(DATA_HASH_MODES)}")
+        self.data_hash_mode = data_hash_mode
 
         months: list[MonthlyCellGrid] = []
         feature_metadata: FeatureMetadata | None = None
@@ -385,17 +495,33 @@ class CellDataset:
             for month_index in range(len(self.months))
             for cell in self.cell_locations
         )
-        data_manifest = [
-            {
+        data_manifest: list[dict[str, Any]] = []
+        content_identity: list[dict[str, Any]] = []
+        for index, path in enumerate(self.npz_paths):
+            entry: dict[str, Any] = {
                 "index": index,
                 "file_name": path.name,
                 "file_sha256": file_sha256(path),
                 "month_id": self.months[index].month_id,
             }
-            for index, path in enumerate(self.npz_paths)
-        ]
+            if self.data_hash_mode == "canonical_npz_content":
+                content_sha256 = canonical_npz_content_sha256(path)
+                entry["content_sha256"] = content_sha256
+                content_identity.append(
+                    {
+                        "index": index,
+                        "file_name": path.name,
+                        "content_sha256": content_sha256,
+                        "month_id": self.months[index].month_id,
+                    }
+                )
+            data_manifest.append(entry)
         self.data_manifest = tuple(data_manifest)
-        self.data_sha256 = canonical_sha256(data_manifest)
+        self.data_sha256 = canonical_sha256(
+            content_identity
+            if self.data_hash_mode == "canonical_npz_content"
+            else data_manifest
+        )
         self.preprocessing: PreprocessingStats | None = None
         if preprocessing is not None:
             if preprocessing_split_sha256 is None:

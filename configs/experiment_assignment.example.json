@@ -1,0 +1,51 @@
+{
+  "schema_version": "cell_msca.experiment_assignment.v1",
+  "hyperparameter_policy": "frozen_no_independent_changes",
+  "instructions": "Owners execute the assigned frozen configuration. Hyperparameters, hashes, split, inverse selection, and test gate must not be changed independently.",
+  "assignments": [
+    {
+      "owner": "replace-with-owner-a",
+      "experiment_id": "replace-with-runner-id-token-no-attention",
+      "model_family": "cell_msca",
+      "variant": "token_no_attention",
+      "loss": "log_huber",
+      "seed": 3407,
+      "status": "assigned",
+      "output_location": "/kaggle/working/cell-msca-validation",
+      "notes": "Execute the frozen configuration without independent tuning."
+    },
+    {
+      "owner": "replace-with-owner-b",
+      "experiment_id": "replace-with-runner-id-forward",
+      "model_family": "cell_msca",
+      "variant": "forward",
+      "loss": "log_huber",
+      "seed": 3407,
+      "status": "assigned",
+      "output_location": "/kaggle/working/cell-msca-validation",
+      "notes": "Execute the frozen configuration without independent tuning."
+    },
+    {
+      "owner": "replace-with-owner-c",
+      "experiment_id": "replace-with-runner-id-reverse",
+      "model_family": "cell_msca",
+      "variant": "reverse",
+      "loss": "log_huber",
+      "seed": 3407,
+      "status": "assigned",
+      "output_location": "/kaggle/working/cell-msca-validation",
+      "notes": "Execute the frozen configuration without independent tuning."
+    },
+    {
+      "owner": "replace-with-owner-d",
+      "experiment_id": "replace-with-runner-id-bidirectional",
+      "model_family": "cell_msca",
+      "variant": "bidirectional",
+      "loss": "log_huber",
+      "seed": 3407,
+      "status": "assigned",
+      "output_location": "/kaggle/working/cell-msca-validation",
+      "notes": "Execute the frozen configuration without independent tuning."
+    }
+  ]
+}
