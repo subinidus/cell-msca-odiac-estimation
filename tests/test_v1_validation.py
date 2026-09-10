@@ -195,7 +195,7 @@ class V1LegacyValidationPackageTests(unittest.TestCase):
                 actual = canonical_sha256(
                     config.to_dict(
                         train_seed=values["frozen_train_seed"],
-                        target_scale=values["data"]["target_scale"],
+                        target_scale=float(values["data"]["target_scale"]),
                     )
                 )
                 self.assertEqual(actual, expected_digest, msg=f"{path}: {key}")

@@ -58,14 +58,14 @@
     "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
     "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
     "configuration_sha256_by_variant_and_device": {
-      "token_no_attention:cpu": "c3b1e13c6f40de3e8e95246204b879689d7e5603cddf0c122258f68e0bd288d4",
-      "token_no_attention:cuda": "44ba02fbf45747945903d0b661f7dcad1688a0c4dae434802fbc9689b63fb6bb",
-      "forward:cpu": "0b376df8f6e8f4815e7588cc306e83ed0c2073a8c73c27e630b31ea63231cce0",
-      "forward:cuda": "0525fc36b9fa720a898d6dd4b74b902ae238b9e61d794cface4ac60c01866638",
-      "reverse:cpu": "9b51f04de742dab1ab9b6ef517dd557cd3cf8b0ec82b48fb2bc7d6503cbf7bb2",
-      "reverse:cuda": "e8327d6a3e0621deebf17f6c008ce9202ccd5eaae9de5b66085b70f90063739e",
-      "bidirectional:cpu": "228b937767c8cfcd806beac20f3c62a7d671df426fadcc186f347d4802d066c7",
-      "bidirectional:cuda": "2f45edb72aa1fec8f992491cbf93ec1ec79acc0ebd4ed5f60649019f818e8640"
+      "token_no_attention:cpu": "4a7d573b9c861443d34710010f74fba6e350e07aaa0cc593f9f43b5f8d06a052",
+      "token_no_attention:cuda": "0d30ab4792df0aceab7257882bdfcb8b30db4ff24b5c59848abfc357eba7073a",
+      "forward:cpu": "29723167c75284e0eb2aa90c32f71a4cfb568ce3207cc3e5ca74e678f104739a",
+      "forward:cuda": "71130b9542d19eddff0949d0c22c61625934ab1f5d576b6954f99c2ffa9103f5",
+      "reverse:cpu": "05cba0c4058ccc5b95bdf4718d04a52e76e6f8000b5a31a75470735d0a5c6892",
+      "reverse:cuda": "22a19661de6cc2d046a1b3a78c098b0ba2614049eca9c3cae05f9f2e93e7a604",
+      "bidirectional:cpu": "f43a458bc65311801ca3b393caee0611950b46bb138a1d30025f2b472c35f3f2",
+      "bidirectional:cuda": "9243edbd9c39ecaa840834df11ba3ce07dbe5c7a39581afc414ca38f67010322"
     }
   }
 }

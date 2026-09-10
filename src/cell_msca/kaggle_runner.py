@@ -935,9 +935,7 @@ def run_kaggle_validation(
         test_ratio=float(split_values["test_ratio"]),
     )
     training_config = _build_training_config(values, variant=variant, device=device)
-    # Keep the frozen JSON scalar representation in the configuration contract.
-    # In particular, canonical JSON distinguishes ``1`` from ``1.0``.
-    target_scale = values["data"].get("target_scale", 1.0)
+    target_scale = float(values["data"].get("target_scale", 1.0))
     configuration_sha256 = canonical_sha256(
         training_config.to_dict(train_seed=train_seed, target_scale=target_scale)
     )
