@@ -1,0 +1,172 @@
+{
+  "schema_version": "cell_msca.phase5a_validation_robustness.v1",
+  "stage": "validation_only",
+  "allowed_materialized_splits": [
+    "train",
+    "validation"
+  ],
+  "required_base_git_sha": "034712aff6670b0fdb8b272e7b9311dc9b652830",
+  "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
+  "execution_policy": {
+    "default_action": "integrity_only",
+    "full_validation_enabled_by_default": false,
+    "requires_explicit_allow_full_validation": true,
+    "sequence": [
+      "integrity_only",
+      "synthetic_smoke",
+      "full_validation"
+    ]
+  },
+  "data": {
+    "data_version": "v1_legacy",
+    "archive_manifest": "configs/v1_legacy_archive_manifest.json",
+    "archive_name": "2022_2024_npz.zip",
+    "target_scale": 1,
+    "target_definition": "v1_legacy ODIAC-derived zonal mean",
+    "target_claim_exclusions": [
+      "not a verified target-cell total",
+      "not a direct emissions measurement",
+      "not a mass-conserving target",
+      "physical unit remains unresolved"
+    ],
+    "known_preprocessing_limitation": "The archived features already include upstream month-wide whole-grid missing-value imputation performed before the persistent split. Current train-only preprocessing cannot reverse that operation.",
+    "input_modes": [
+      "exactly one frozen archive",
+      "exactly one expanded directory containing all 36 frozen NPZ files"
+    ],
+    "expanded_input_contract": "Every file name, byte size, file SHA-256, and canonical NPZ content SHA-256 must match the frozen archive manifest."
+  },
+  "split": {
+    "csv": "splits/cell_fixed_seed42.csv",
+    "metadata_json": "splits/cell_fixed_seed42.metadata.v2.json",
+    "split_seed": 42,
+    "persistent_split_recreation_allowed": false
+  },
+  "seeds": {
+    "split_seed": 42,
+    "all": [
+      42,
+      43,
+      44
+    ],
+    "new_training": [
+      43,
+      44
+    ],
+    "seed42_policy": "reuse the frozen full-validation package; do not retrain neural candidates"
+  },
+  "required_hashes": {
+    "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+    "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+    "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+    "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db"
+  },
+  "seed42_cell_config": "configs/v1_legacy_cell_msca_validation.json",
+  "seed42_expected_configuration_sha256": {
+    "cell_msca_bidirectional": "9243edbd9c39ecaa840834df11ba3ce07dbe5c7a39581afc414ca38f67010322",
+    "cell_msca_token_no_attention": "0d30ab4792df0aceab7257882bdfcb8b30db4ff24b5c59848abfc357eba7073a",
+    "lightgbm_raw": "5258ec66eeb067c636b20073a8bd157b7a195ab015771432689d2587227f67a5",
+    "lightgbm_log1p": "aa52fccb10785bf6fac8ec5812b7e5c17b91c805450c8abfe8cb812e912f5f45"
+  },
+  "seed42_reference_mae_rounded_6dp": {
+    "cell_msca_bidirectional": 59.044645,
+    "lightgbm_raw": 59.585609,
+    "lightgbm_log1p": 59.607368,
+    "cell_msca_token_no_attention": 59.681876
+  },
+  "lightgbm_convergence": {
+    "candidates": [
+      "lightgbm_raw",
+      "lightgbm_log1p"
+    ],
+    "parameters": {
+      "n_estimators": 5000,
+      "learning_rate": 0.03,
+      "num_leaves": 31,
+      "min_child_samples": 20,
+      "subsample": 1,
+      "colsample_bytree": 1,
+      "reg_lambda": 0,
+      "early_stopping_rounds": 200
+    },
+    "selection_metric": "validation_original_unit_mae",
+    "tie_break_order": [
+      "lightgbm_raw",
+      "lightgbm_log1p"
+    ],
+    "documentation": {
+      "parameters": "https://lightgbm.readthedocs.io/en/latest/Parameters.html",
+      "python_early_stopping": "https://lightgbm.readthedocs.io/en/stable/Python-Intro.html",
+      "callback": "https://lightgbm.readthedocs.io/en/v4.6.0/pythonapi/lightgbm.early_stopping.html",
+      "project_specific_rationale": "Both seed-42 candidates reached the previous 1000-round ceiling. A fivefold 5000-round diagnostic cap and 200-round patience are fixed before observing new results. The official documentation defines the mechanisms but does not prescribe these exact values."
+    },
+    "record_maximum_iteration_reached": true,
+    "tweedie_repeated": false
+  },
+  "repeated_models": {
+    "neural": [
+      "bidirectional",
+      "token_no_attention"
+    ],
+    "lightgbm": "selected_by_convergence_gate",
+    "excluded": [
+      "forward",
+      "reverse",
+      "concat_mlp",
+      "lightgbm_tweedie"
+    ]
+  },
+  "cell_runtime_configs": {
+    "43": "configs/phase5a_cell_msca_seed43.json",
+    "44": "configs/phase5a_cell_msca_seed44.json"
+  },
+  "cell_required_hashes_by_seed": {
+    "43": {
+      "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+      "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+      "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+      "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
+      "configuration_sha256_by_variant_and_device": {
+        "token_no_attention:cpu": "fa743e20f770076baffcc884273054a8ace8b04db272d1eb87df3fddde04c088",
+        "token_no_attention:cuda": "2601e9b1875a53c651aeec4a697e2fec25344db9dc8aa1c6fc9f7ad4b7e48a8f",
+        "bidirectional:cpu": "b7736f943d18d266510d3131215e8c879601a5bbb62aaab221353022b2fa3147",
+        "bidirectional:cuda": "fc2ef18b89036d4b0f5090a321ed59336fadc4000a28f39bc03f1306a1be51f1"
+      }
+    },
+    "44": {
+      "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+      "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+      "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+      "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
+      "configuration_sha256_by_variant_and_device": {
+        "token_no_attention:cpu": "b1f03d8cfd384eb10e9b0c6113a8b468ec898b68d6451fe6af73a88126fba9b7",
+        "token_no_attention:cuda": "95a395534b005b35335d839df3848c10e8c654d29425ef39f52504301e989001",
+        "bidirectional:cpu": "37dc8ff610d15024bd660429eeb2b74784895ef6cc828b4654cd7ce821aac99c",
+        "bidirectional:cuda": "2924d4447076c9be599b963f291a48026149b6a46d8fdec6e002a2d2e6d2758a"
+      }
+    }
+  },
+  "aggregation": {
+    "metrics": [
+      "original_unit_mae",
+      "original_unit_rmse",
+      "original_unit_r2",
+      "original_unit_bias",
+      "spearman"
+    ],
+    "standard_deviation_ddof": 1,
+    "prediction_metric_recalculation_required": true,
+    "row_and_cell_id_alignment_required": true
+  },
+  "paired_cluster_bootstrap": {
+    "resampling_unit": "validation_cell_id",
+    "rows_per_cell": 36,
+    "n_boot": 10000,
+    "seed": 3407,
+    "alpha": 0.05,
+    "interval": "percentile",
+    "difference_orientation": "mae_bidirectional_minus_mae_comparator",
+    "prediction_basis": "rowwise_mean_of_three_frozen_seed_predictions",
+    "limitation": "The cell-cluster bootstrap conditions on seed-mean predictions and does not incorporate training-seed uncertainty."
+  }
+}

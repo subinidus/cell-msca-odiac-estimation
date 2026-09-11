@@ -1,0 +1,67 @@
+{
+  "schema_version": "cell_msca.kaggle_validation.v1",
+  "stage": "validation_only",
+  "allowed_materialized_splits": [
+    "train",
+    "validation"
+  ],
+  "owner": "assign-gpu-owner",
+  "model_family": "cell_msca",
+  "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
+  "execution_policy": {
+    "default_action": "integrity_only",
+    "full_validation_enabled_by_default": false,
+    "requires_explicit_allow_full_validation": true,
+    "scope": "Phase 5A frozen seed-44 validation repeat"
+  },
+  "project_root": "..",
+  "frozen_train_seed": 44,
+  "data": {
+    "mode": "npz",
+    "npz_glob": "*.npz",
+    "data_hash_mode": "file_bytes",
+    "target_scale": 1,
+    "legacy_data_version": "v1_legacy",
+    "legacy_target_unit": "ODIAC native value; exact target-cell interpretation unverified",
+    "target_definition": "v1_legacy ODIAC-derived zonal mean",
+    "upstream_missing_value_limitation": "Month-wide whole-grid imputation is already embedded and cannot be reversed by train-only preprocessing."
+  },
+  "split": {
+    "csv": "splits/cell_fixed_seed42.csv",
+    "metadata_json": "splits/cell_fixed_seed42.metadata.v2.json",
+    "split_seed": 42,
+    "validation_ratio": 0.15,
+    "test_ratio": 0.15
+  },
+  "training": {
+    "architecture": {
+      "d_model": 32,
+      "num_heads": 4,
+      "encoder_layers": 1,
+      "ffn_multiplier": 2,
+      "head_hidden": 32,
+      "dropout": 0.1,
+      "attention_dropout": 0
+    },
+    "loss": "log_huber",
+    "huber_delta": 1,
+    "learning_rate": 0.001,
+    "batch_size": 256,
+    "max_epochs": 200,
+    "patience": 20,
+    "min_delta": 0,
+    "weight_decay": 0.00001
+  },
+  "required_hashes": {
+    "data_sha256": "c3a1889fd863117c3faa9125094267974dbacfe6fd4ca6c157dead2d7c874b62",
+    "split_sha256": "8b795ab11ad741a5e161b08ee1c2d44cefa1b21e5b6a0a724a7ca88a85cacb40",
+    "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
+    "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
+    "configuration_sha256_by_variant_and_device": {
+      "token_no_attention:cpu": "b1f03d8cfd384eb10e9b0c6113a8b468ec898b68d6451fe6af73a88126fba9b7",
+      "token_no_attention:cuda": "95a395534b005b35335d839df3848c10e8c654d29425ef39f52504301e989001",
+      "bidirectional:cpu": "37dc8ff610d15024bd660429eeb2b74784895ef6cc828b4654cd7ce821aac99c",
+      "bidirectional:cuda": "2924d4447076c9be599b963f291a48026149b6a46d8fdec6e002a2d2e6d2758a"
+    }
+  }
+}
