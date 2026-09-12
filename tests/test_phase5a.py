@@ -9,6 +9,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -21,11 +22,14 @@ from cell_msca.evaluate import (
     write_metrics_json,
     write_prediction_csv,
 )
+from cell_msca.kaggle_runner import GitIdentity
 from cell_msca.phase5a import (
     _aligned_prediction_arrays,
     _build_parser,
+    _lightgbm_actual_iterations,
     _lightgbm_experiment_id,
     _lightgbm_config,
+    _lightgbm_iteration_summary,
     _seed_metric_summary,
     _validate_phase5a_output_path,
     aggregate_phase5a_results,
@@ -102,7 +106,15 @@ def _write_validation_artifact(
     )
     write_metrics_json(
         directory / "validation_metrics.json",
-        {"artifact_classification": "validation-only", "result": result},
+        {
+            "artifact_classification": "validation-only",
+            **(
+                {"actual_iterations": 25}
+                if model_name.startswith("lightgbm")
+                else {}
+            ),
+            "result": result,
+        },
     )
     write_metrics_json(
         directory / "run_manifest.json",
@@ -118,6 +130,11 @@ def _write_validation_artifact(
             "allowed_materialized_splits": ["train", "validation"],
             "test_subset_materialized": False,
             "test_evaluation_performed": False,
+            **(
+                {"actual_iterations": 25}
+                if model_name.startswith("lightgbm")
+                else {}
+            ),
             "maximum_iteration_reached": False,
         },
     )
@@ -369,6 +386,64 @@ class Phase5AContractTests(unittest.TestCase):
             self.assertEqual(selection["selected_model_name"], "lightgbm_raw")
             self.assertFalse(selection["test_subset_materialized"])
 
+            tampered = json.loads(json.dumps(selection))
+            tampered["selected_model_name"] = "lightgbm_log1p"
+            selection_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                load_lightgbm_selection(selection_path, config_path=self.config_path)
+
+            for invalid_mae in (
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+                "1.0",
+                True,
+            ):
+                with self.subTest(invalid_mae=invalid_mae):
+                    invalid = json.loads(json.dumps(selection))
+                    invalid["candidate_results"]["lightgbm_raw"][
+                        "validation_original_unit_mae"
+                    ] = invalid_mae
+                    selection_path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "finite number"):
+                        load_lightgbm_selection(
+                            selection_path,
+                            config_path=self.config_path,
+                        )
+
+            tie = json.loads(json.dumps(selection))
+            tie["candidate_results"]["lightgbm_log1p"][
+                "validation_original_unit_mae"
+            ] = tie["candidate_results"]["lightgbm_raw"][
+                "validation_original_unit_mae"
+            ]
+            selection_path.write_text(json.dumps(tie), encoding="utf-8")
+            tied_selection = load_lightgbm_selection(
+                selection_path,
+                config_path=self.config_path,
+            )
+            self.assertEqual(tied_selection["selected_model_name"], "lightgbm_raw")
+
+            wrong_tie_winner = json.loads(json.dumps(tie))
+            wrong_tie_winner["selected_model_name"] = "lightgbm_log1p"
+            selection_path.write_text(json.dumps(wrong_tie_winner), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                load_lightgbm_selection(selection_path, config_path=self.config_path)
+
+            missing_candidate = json.loads(json.dumps(selection))
+            del missing_candidate["candidate_results"]["lightgbm_log1p"]
+            selection_path.write_text(json.dumps(missing_candidate), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be exactly"):
+                load_lightgbm_selection(selection_path, config_path=self.config_path)
+
+            invalid_schema = json.loads(json.dumps(selection))
+            del invalid_schema["candidate_results"]["lightgbm_raw"][
+                "actual_iterations"
+            ]
+            selection_path.write_text(json.dumps(invalid_schema), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "candidate schema"):
+                load_lightgbm_selection(selection_path, config_path=self.config_path)
+
             selection["required_hashes"]["data_sha256"] = "f" * 64
             selection_path.write_text(json.dumps(selection), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "provenance hashes"):
@@ -389,6 +464,141 @@ class Phase5AContractTests(unittest.TestCase):
             key for key in old_values if old_values[key] != new_values[key]
         }
         self.assertEqual(changed, {"n_estimators", "early_stopping_rounds"})
+
+    def test_actual_lightgbm_iterations_use_documented_api_and_fail_closed(self) -> None:
+        estimator = SimpleNamespace(n_estimators_=100, n_iter_=99)
+        self.assertEqual(_lightgbm_actual_iterations(estimator), 100)
+        at_cap = _lightgbm_iteration_summary(
+            estimator,
+            best_iteration=80,
+            configured_n_estimators=100,
+        )
+        self.assertEqual(at_cap["best_iteration"], 80)
+        self.assertEqual(at_cap["actual_iterations"], 100)
+        self.assertTrue(at_cap["maximum_iteration_reached"])
+
+        early_stopped = _lightgbm_iteration_summary(
+            SimpleNamespace(n_iter_=70),
+            best_iteration=60,
+            configured_n_estimators=100,
+        )
+        self.assertEqual(early_stopped["actual_iterations"], 70)
+        self.assertFalse(early_stopped["maximum_iteration_reached"])
+
+        booster_fallback = SimpleNamespace(
+            booster_=SimpleNamespace(current_iteration=lambda: 37)
+        )
+        self.assertEqual(_lightgbm_actual_iterations(booster_fallback), 37)
+        with self.assertRaisesRegex(RuntimeError, "unable to determine"):
+            _lightgbm_actual_iterations(SimpleNamespace())
+
+    def test_lightgbm_run_persists_actual_iterations_and_closed_test_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            hashes = dict(self.values["required_hashes"])
+            target = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+            target_log = np.log1p(target)
+            config_sha256 = canonical_sha256(
+                _lightgbm_config(self.values, model_name="lightgbm_raw").to_dict(
+                    train_seed=42,
+                    target_scale=float(self.values["data"]["target_scale"]),
+                )
+            )
+            context = BaselineResultContext(
+                model_name="lightgbm_raw",
+                data_version="v1_legacy",
+                data_sha256=hashes["data_sha256"],
+                split_sha256=hashes["split_sha256"],
+                split_config_sha256=hashes["split_config_sha256"],
+                config_sha256=config_sha256,
+                preprocessing_sha256=hashes["preprocessing_sha256"],
+                split_seed=42,
+                train_seed=42,
+                evaluation_split="validation",
+                target_transform="identity",
+                target_scale=float(self.values["data"]["target_scale"]),
+                loss_objective="regression_l1",
+                inverse_mode="none",
+                best_iteration=4800,
+            )
+            result = evaluate_baseline_predictions(
+                context,
+                y_true_original=target,
+                y_pred_original=target,
+                y_true_log=target_log,
+                y_pred_log=target_log,
+            )
+            validation = SimpleNamespace(
+                target_original=target,
+                target_log=target_log,
+                cell_ids=np.asarray(["cell-a", "cell-b", "cell-c"]),
+            )
+            provenance = SimpleNamespace(
+                **hashes,
+                split_seed=42,
+                train_seed=42,
+            )
+            data = SimpleNamespace(validation=validation, provenance=provenance)
+            protocol = SimpleNamespace(
+                provenance=provenance,
+                tuning_data=mock.Mock(return_value=data),
+                test_data=mock.Mock(),
+            )
+            verified = SimpleNamespace(
+                protocol=protocol,
+                kaggle=False,
+                input_mode="synthetic-test",
+                summary={"artifact_classification": "engineering-only"},
+            )
+            fitted = SimpleNamespace(estimator=SimpleNamespace(n_estimators_=5000))
+            evaluation = SimpleNamespace(
+                result=result,
+                predictions=SimpleNamespace(
+                    pred_original=target,
+                    pred_log=target_log,
+                ),
+            )
+            git_sha = "a" * 40
+            identity = GitIdentity(
+                commit_sha=git_sha,
+                worktree_dirty=False,
+                dirty_state_policy="tracked_and_untracked_clean",
+                source="git",
+            )
+            with (
+                mock.patch(
+                    "cell_msca.phase5a.fit_lightgbm_baseline",
+                    return_value=fitted,
+                ),
+                mock.patch(
+                    "cell_msca.phase5a.evaluate_fitted_baseline",
+                    return_value=evaluation,
+                ),
+            ):
+                output = run_phase5a_lightgbm(
+                    verified,
+                    config_path=self.config_path,
+                    output_root=Path(directory) / "runs",
+                    repository_root=self.root,
+                    expected_git_sha=git_sha,
+                    model_name="lightgbm_raw",
+                    train_seed=42,
+                    run_type="convergence",
+                    allow_full_validation=True,
+                    git_identity=identity,
+                )
+            metrics = json.loads(
+                (output / "validation_metrics.json").read_text(encoding="utf-8")
+            )
+            manifest = json.loads(
+                (output / "run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metrics["actual_iterations"], 5000)
+            self.assertEqual(manifest["best_iteration"], 4800)
+            self.assertEqual(manifest["actual_iterations"], 5000)
+            self.assertTrue(manifest["maximum_iteration_reached"])
+            self.assertFalse(manifest["test_subset_materialized"])
+            self.assertFalse(manifest["test_evaluation_performed"])
+            protocol.test_data.assert_not_called()
 
     def test_synthetic_three_seed_aggregation_recomputes_and_bootstraps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

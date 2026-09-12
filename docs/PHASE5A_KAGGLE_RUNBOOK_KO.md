@@ -35,12 +35,15 @@ whole-grid 결측치 대체가 이미 적용되어 있으며, 현재 train-only 
 | `early_stopping_rounds` | 50 | 200 |
 
 LightGBM 공식 [Parameters](https://lightgbm.readthedocs.io/en/latest/Parameters.html),
-[Python guide](https://lightgbm.readthedocs.io/en/stable/Python-Intro.html),
+[LGBMRegressor API](https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMRegressor.html),
 [early-stopping callback](https://lightgbm.readthedocs.io/en/v4.6.0/pythonapi/lightgbm.early_stopping.html)
 문서는 boosting-round 상한과 validation metric 기반 early stopping의 동작을
 근거로 한다. 5,000/200이라는 수치는 공식 권장값이 아니라 이전 상한 도달을
 확인하기 위한 프로젝트 고유의 진단 설정이며, 새 결과를 보기 전에 동결한다.
-각 manifest는 `best_iteration`과 `maximum_iteration_reached`를 함께 기록한다.
+각 validation metrics artifact와 manifest는 최적 점수 시점인 `best_iteration`과
+실제 수행 횟수인 `actual_iterations`를 구분해 기록한다. 상한 도달 여부는 공식
+sklearn API의 `n_estimators_`/`n_iter_` 또는 Booster fallback으로 얻은
+`actual_iterations`를 기준으로만 계산한다.
 
 log1p 모델의 early stopping metric은 median inverse validation original-unit MAE다.
 checkpoint가 정해진 뒤 train residual만으로 Duan factor를 계산하고, validation에서
@@ -166,7 +169,9 @@ python -m cell_msca.phase5a --config "$CONFIG" freeze-lightgbm-selection \
 ```
 
 이 파일이 생성되기 전에는 selected LightGBM seed 43/44 실행이 거부된다. 파일의
-model, parameter, provenance/config/Git hash가 다르면 역시 중단한다.
+model, parameter, provenance/config/Git hash가 다르면 역시 중단한다. 파일을 다시
+읽을 때 candidate row schema와 finite validation original-unit MAE를 검사하고, 같은
+tie-break 순서로 승자를 재계산하므로 저장된 `selected_model_name` 변조도 거부한다.
 
 ### 5.5 seed 43/44 반복
 

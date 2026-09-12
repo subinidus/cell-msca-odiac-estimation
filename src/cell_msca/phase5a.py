@@ -13,6 +13,7 @@ import platform
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from numbers import Real
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -45,6 +46,17 @@ LIGHTGBM_CANDIDATES = ("lightgbm_raw", "lightgbm_log1p")
 NEURAL_CANDIDATES = ("cell_msca_bidirectional", "cell_msca_token_no_attention")
 REPEATED_SEEDS = (42, 43, 44)
 NEW_SEEDS = (43, 44)
+_LIGHTGBM_CANDIDATE_RESULT_FIELDS = frozenset(
+    {
+        "validation_original_unit_mae",
+        "best_iteration",
+        "actual_iterations",
+        "maximum_iteration_reached",
+        "configuration_sha256",
+        "manifest_sha256",
+        "prediction_sha256",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -351,6 +363,68 @@ def _lightgbm_experiment_id(
     return f"phase5a_{run_type}_lightgbm_{suffix}_seed{seed}-{fingerprint[:12]}"
 
 
+def _positive_iteration_count(value: Any, *, source: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise RuntimeError(f"{source} must provide a positive integer iteration count")
+    count = int(value)
+    if count <= 0:
+        raise RuntimeError(f"{source} must provide a positive integer iteration count")
+    return count
+
+
+def _lightgbm_actual_iterations(estimator: Any) -> int:
+    """Return the true fitted iteration count from documented LightGBM APIs."""
+
+    for attribute in ("n_estimators_", "n_iter_"):
+        try:
+            value = getattr(estimator, attribute)
+        except AttributeError:
+            continue
+        if value is not None:
+            return _positive_iteration_count(value, source=f"LightGBM {attribute}")
+
+    try:
+        booster = getattr(estimator, "booster_")
+    except AttributeError:
+        booster = None
+    if booster is not None:
+        current_iteration = getattr(booster, "current_iteration", None)
+        if callable(current_iteration):
+            return _positive_iteration_count(
+                current_iteration(),
+                source="LightGBM booster_.current_iteration()",
+            )
+    raise RuntimeError(
+        "unable to determine actual LightGBM iterations: fitted estimator exposes "
+        "neither n_estimators_, n_iter_, nor booster_.current_iteration()"
+    )
+
+
+def _lightgbm_iteration_summary(
+    estimator: Any,
+    *,
+    best_iteration: int,
+    configured_n_estimators: int,
+) -> dict[str, Any]:
+    best = _positive_iteration_count(
+        best_iteration,
+        source="LightGBM best_iteration",
+    )
+    upper_bound = _positive_iteration_count(
+        configured_n_estimators,
+        source="configured LightGBM n_estimators",
+    )
+    actual = _lightgbm_actual_iterations(estimator)
+    return {
+        "best_iteration": best,
+        "actual_iterations": actual,
+        "maximum_iteration_reached": actual >= upper_bound,
+    }
+
+
 def _ensure_full_validation_allowed(
     values: Mapping[str, Any],
     allow_full_validation: bool,
@@ -458,6 +532,12 @@ def run_phase5a_lightgbm(
         data.provenance,
     )
     result = evaluation.result
+    upper_bound = int(values["lightgbm_convergence"]["parameters"]["n_estimators"])
+    iteration_summary = _lightgbm_iteration_summary(
+        fitted.estimator,
+        best_iteration=int(result["best_iteration"]),
+        configured_n_estimators=upper_bound,
+    )
     prediction_path = output_dir / "validation_predictions.csv"
     metrics_path = output_dir / "validation_metrics.json"
     manifest_path = output_dir / "run_manifest.json"
@@ -477,13 +557,12 @@ def run_phase5a_lightgbm(
             "schema_version": "cell_msca.validation_metrics_artifact.v1",
             "artifact_classification": "validation-only",
             "prediction_metric_verification": "passed_including_spearman",
+            "actual_iterations": iteration_summary["actual_iterations"],
             "result": result,
         },
     )
     environment = _runtime_environment()
     write_metrics_json(environment_path, environment)
-    upper_bound = int(values["lightgbm_convergence"]["parameters"]["n_estimators"])
-    best_iteration = int(result["best_iteration"])
     write_metrics_json(
         manifest_path,
         {
@@ -514,8 +593,7 @@ def run_phase5a_lightgbm(
                     "early_stopping_rounds"
                 ]
             ),
-            "best_iteration": best_iteration,
-            "maximum_iteration_reached": best_iteration >= upper_bound,
+            **iteration_summary,
             "selection_metric": "validation_original_unit_mae",
             "allowed_materialized_splits": ["train", "validation"],
             "test_subset_materialized": False,
@@ -632,6 +710,87 @@ def _validate_artifact_contract(
         raise ValueError("stored validation artifact configuration SHA-256 mismatch")
 
 
+def _selection_positive_iteration(value: Any, *, field: str) -> int:
+    try:
+        return _positive_iteration_count(value, source=field)
+    except RuntimeError as error:
+        raise ValueError(
+            f"invalid LightGBM selection candidate field: {field}"
+        ) from error
+
+
+def _selection_sha256(value: Any, *, field: str) -> str:
+    digest = str(value)
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"invalid LightGBM selection candidate SHA-256: {field}")
+    return digest
+
+
+def _validated_lightgbm_candidate_results(
+    selection: Mapping[str, Any],
+    *,
+    master: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    candidates = selection.get("candidate_results")
+    if not isinstance(candidates, dict) or set(candidates) != set(
+        LIGHTGBM_CANDIDATES
+    ):
+        raise ValueError(
+            "LightGBM selection candidates must be exactly lightgbm_raw and "
+            "lightgbm_log1p"
+        )
+    upper_bound = int(master["lightgbm_convergence"]["parameters"]["n_estimators"])
+    for model_name in LIGHTGBM_CANDIDATES:
+        row = candidates[model_name]
+        if not isinstance(row, dict) or set(row) != _LIGHTGBM_CANDIDATE_RESULT_FIELDS:
+            raise ValueError(f"invalid LightGBM selection candidate schema: {model_name}")
+        mae = row["validation_original_unit_mae"]
+        if (
+            isinstance(mae, (bool, np.bool_))
+            or not isinstance(mae, Real)
+            or not np.isfinite(float(mae))
+        ):
+            raise ValueError(
+                "LightGBM candidate validation_original_unit_mae must be a finite number"
+            )
+        _selection_positive_iteration(
+            row["best_iteration"],
+            field=f"{model_name}.best_iteration",
+        )
+        actual_iterations = _selection_positive_iteration(
+            row["actual_iterations"],
+            field=f"{model_name}.actual_iterations",
+        )
+        maximum_reached = row["maximum_iteration_reached"]
+        if not isinstance(maximum_reached, bool):
+            raise ValueError(
+                f"{model_name}.maximum_iteration_reached must be a boolean"
+            )
+        if maximum_reached != (actual_iterations >= upper_bound):
+            raise ValueError(
+                f"{model_name}.maximum_iteration_reached disagrees with actual_iterations"
+            )
+        for field in (
+            "configuration_sha256",
+            "manifest_sha256",
+            "prediction_sha256",
+        ):
+            _selection_sha256(row[field], field=f"{model_name}.{field}")
+        expected_config_sha256 = canonical_sha256(
+            _lightgbm_config(master, model_name=model_name).to_dict(
+                train_seed=42,
+                target_scale=float(master["data"]["target_scale"]),
+            )
+        )
+        if row["configuration_sha256"] != expected_config_sha256:
+            raise ValueError(
+                f"LightGBM selection candidate configuration mismatch: {model_name}"
+            )
+    return candidates
+
+
 def freeze_lightgbm_convergence_selection(
     *,
     raw_run_dir: str | Path,
@@ -665,11 +824,25 @@ def freeze_lightgbm_convergence_selection(
             expected_git_sha=expected_git_sha,
             expected_config_sha256=expected_config,
         )
+        metrics_artifact = _read_json(artifact.metrics_path)
+        metrics_actual_iterations = _selection_positive_iteration(
+            metrics_artifact.get("actual_iterations"),
+            field=f"{model_name}.validation_metrics.actual_iterations",
+        )
+        manifest_actual_iterations = _selection_positive_iteration(
+            artifact.manifest.get("actual_iterations"),
+            field=f"{model_name}.run_manifest.actual_iterations",
+        )
+        if metrics_actual_iterations != manifest_actual_iterations:
+            raise ValueError(
+                f"LightGBM actual_iterations mismatch between metrics and manifest: {model_name}"
+            )
         candidate_rows[model_name] = {
             "validation_original_unit_mae": artifact.result["headline_metrics"][
                 "original_unit"
             ]["mae"],
             "best_iteration": artifact.result["best_iteration"],
+            "actual_iterations": manifest_actual_iterations,
             "maximum_iteration_reached": artifact.manifest[
                 "maximum_iteration_reached"
             ],
@@ -735,11 +908,21 @@ def load_lightgbm_selection(
         "parameters"
     ]:
         raise ValueError("LightGBM selection parameters changed")
-    candidates = selection.get("candidate_results")
-    if not isinstance(candidates, dict) or set(candidates) != set(
-        LIGHTGBM_CANDIDATES
-    ):
-        raise ValueError("LightGBM selection candidates changed")
+    if selection.get("tie_break_order") != list(LIGHTGBM_CANDIDATES):
+        raise ValueError("LightGBM selection tie-break order changed")
+    candidates = _validated_lightgbm_candidate_results(selection, master=master)
+    selected_model = min(
+        LIGHTGBM_CANDIDATES,
+        key=lambda name: (
+            float(candidates[name]["validation_original_unit_mae"]),
+            LIGHTGBM_CANDIDATES.index(name),
+        ),
+    )
+    if selection.get("selected_model_name") != selected_model:
+        raise ValueError(
+            "LightGBM selected_model_name does not match the candidate validation "
+            "original-unit MAE winner"
+        )
     return selection
 
 
