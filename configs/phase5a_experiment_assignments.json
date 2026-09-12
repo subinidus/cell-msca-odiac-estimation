@@ -1,0 +1,147 @@
+{
+  "schema_version": "cell_msca.phase5a_assignment.v1",
+  "stage": "validation_only",
+  "split_seed": 42,
+  "fixed_train_seeds": [
+    42,
+    43,
+    44
+  ],
+  "test_gate": "closed",
+  "hyperparameter_policy": "frozen_before_execution_no_independent_changes",
+  "selection_gate": "Run both seed-42 LightGBM convergence checks, freeze the lower validation original-unit MAE candidate, then run only that candidate for seeds 43 and 44.",
+  "assignments": [
+    {
+      "owner": "integrity-owner",
+      "experiment_id": "phase5a_integrity_only_seed42",
+      "model_family": "data_integrity",
+      "variant": "frozen_v1_input",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "required_first",
+      "output_location": "/kaggle/working/phase5a/integrity_only_seed42",
+      "notes": "Accept exactly one frozen archive or one expanded 36-NPZ directory; do not materialize test samples."
+    },
+    {
+      "owner": "smoke-owner",
+      "experiment_id": "phase5a_synthetic_smoke_all_variants",
+      "model_family": "cell_msca",
+      "variant": "all_four_synthetic_only",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "required_before_project_data",
+      "output_location": "/kaggle/working/phase5a/synthetic_smoke",
+      "notes": "Reuse the Phase 4.3 generated-data smoke; no v1_legacy input."
+    },
+    {
+      "owner": "cpu-owner",
+      "experiment_id": "phase5a_convergence_lightgbm_raw_seed42",
+      "model_family": "lightgbm",
+      "variant": "lightgbm_raw",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "scheduled_convergence_only",
+      "output_location": "/kaggle/working/phase5a/convergence_raw_seed42",
+      "notes": "This is the new capped convergence diagnostic, not a repetition of the prior 1000-round result."
+    },
+    {
+      "owner": "cpu-owner",
+      "experiment_id": "phase5a_convergence_lightgbm_log1p_seed42",
+      "model_family": "lightgbm",
+      "variant": "lightgbm_log1p",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "scheduled_convergence_only",
+      "output_location": "/kaggle/working/phase5a/convergence_log1p_seed42",
+      "notes": "Duan uses train residuals only; median/Duan comparison remains validation-only."
+    },
+    {
+      "owner": "analysis-owner",
+      "experiment_id": "phase5a_freeze_lightgbm_selection",
+      "model_family": "selection",
+      "variant": "raw_or_log1p_gate",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "blocked_until_both_convergence_runs_complete",
+      "output_location": "/kaggle/working/phase5a/selection",
+      "notes": "Freeze the lower validation original-unit MAE model before starting seeds 43 and 44."
+    },
+    {
+      "owner": "gpu-owner",
+      "experiment_id": "phase5a_bidirectional_seed43",
+      "model_family": "cell_msca",
+      "variant": "bidirectional",
+      "train_seed": 43,
+      "device": "cuda",
+      "status": "scheduled_after_integrity_and_smoke",
+      "output_location": "/kaggle/working/phase5a/bidirectional_seed43",
+      "notes": "Use the frozen seed-43 runtime config without hyperparameter changes."
+    },
+    {
+      "owner": "gpu-owner",
+      "experiment_id": "phase5a_token_no_attention_seed43",
+      "model_family": "cell_msca",
+      "variant": "token_no_attention",
+      "train_seed": 43,
+      "device": "cuda",
+      "status": "scheduled_after_integrity_and_smoke",
+      "output_location": "/kaggle/working/phase5a/token_no_attention_seed43",
+      "notes": "Use the frozen seed-43 runtime config without hyperparameter changes."
+    },
+    {
+      "owner": "cpu-owner",
+      "experiment_id": "phase5a_selected_lightgbm_seed43",
+      "model_family": "lightgbm",
+      "variant": "selected_lightgbm",
+      "train_seed": 43,
+      "device": "cpu",
+      "status": "blocked_until_selection_is_frozen",
+      "output_location": "/kaggle/working/phase5a/selected_lightgbm_seed43",
+      "notes": "The runner resolves raw or log1p from the frozen selection file and refuses the other model."
+    },
+    {
+      "owner": "gpu-owner",
+      "experiment_id": "phase5a_bidirectional_seed44",
+      "model_family": "cell_msca",
+      "variant": "bidirectional",
+      "train_seed": 44,
+      "device": "cuda",
+      "status": "scheduled_after_integrity_and_smoke",
+      "output_location": "/kaggle/working/phase5a/bidirectional_seed44",
+      "notes": "Use the frozen seed-44 runtime config without hyperparameter changes."
+    },
+    {
+      "owner": "gpu-owner",
+      "experiment_id": "phase5a_token_no_attention_seed44",
+      "model_family": "cell_msca",
+      "variant": "token_no_attention",
+      "train_seed": 44,
+      "device": "cuda",
+      "status": "scheduled_after_integrity_and_smoke",
+      "output_location": "/kaggle/working/phase5a/token_no_attention_seed44",
+      "notes": "Use the frozen seed-44 runtime config without hyperparameter changes."
+    },
+    {
+      "owner": "cpu-owner",
+      "experiment_id": "phase5a_selected_lightgbm_seed44",
+      "model_family": "lightgbm",
+      "variant": "selected_lightgbm",
+      "train_seed": 44,
+      "device": "cpu",
+      "status": "blocked_until_selection_is_frozen",
+      "output_location": "/kaggle/working/phase5a/selected_lightgbm_seed44",
+      "notes": "The runner resolves raw or log1p from the frozen selection file and refuses the other model."
+    },
+    {
+      "owner": "analysis-owner",
+      "experiment_id": "phase5a_aggregate_three_seeds",
+      "model_family": "analysis",
+      "variant": "three_seed_summary_and_paired_cell_bootstrap",
+      "train_seed": 42,
+      "device": "cpu",
+      "status": "blocked_until_all_required_validation_runs_complete",
+      "output_location": "/kaggle/working/phase5a/aggregation",
+      "notes": "Recompute metrics from prediction CSV, check row/cell_id alignment, and resample complete 36-month cells only."
+    }
+  ]
+}

@@ -65,11 +65,12 @@ _MONTH_FILE_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class VerifiedV1Archive:
-    archive_path: Path
+    archive_path: Path | None
     data_dir: Path
     protocol: BaselineDataProtocol
     summary: Mapping[str, Any]
     kaggle: bool
+    input_mode: str = "archive"
 
 
 def _utc_now() -> str:
@@ -188,36 +189,15 @@ def _validate_kaggle_output(output_root: Path) -> None:
         raise ValueError("Kaggle output_root must be below /kaggle/working") from error
 
 
-@contextmanager
-def verified_v1_archive(
-    *,
-    input_root: str | Path,
-    working_root: str | Path,
+def _load_v1_archive_manifest(
     manifest_path: str | Path,
-    repository_root: str | Path,
-    kaggle: bool = False,
-) -> Iterator[VerifiedV1Archive]:
-    """Verify, temporarily extract, and automatically clean the legacy archive."""
-
-    input_path = Path(input_root).resolve()
-    working_path = Path(working_root).resolve()
-    repository = Path(repository_root).resolve()
-    if kaggle:
-        _validate_kaggle_roots(input_path, working_path)
-    working_path.mkdir(parents=True, exist_ok=True)
-    archive_path = discover_v1_archive(input_path)
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Mapping[str, Any]]]:
     manifest = _read_json(manifest_path)
     if manifest.get("schema_version") != V1_ARCHIVE_MANIFEST_SCHEMA_VERSION:
         raise ValueError("unsupported v1_legacy archive manifest schema_version")
     archive_contract = manifest.get("archive")
     if not isinstance(archive_contract, dict):
         raise ValueError("archive manifest requires an archive object")
-    if archive_path.name != archive_contract.get("file_name"):
-        raise ValueError("archive name does not match the frozen manifest")
-    if archive_path.stat().st_size != int(archive_contract.get("size_bytes", -1)):
-        raise ValueError("archive size does not match the frozen manifest")
-    if file_sha256(archive_path) != archive_contract.get("file_sha256"):
-        raise ValueError("archive SHA-256 does not match the frozen manifest")
     file_entries = manifest.get("files")
     if not isinstance(file_entries, list) or len(file_entries) != 36:
         raise ValueError("archive manifest must contain exactly 36 NPZ entries")
@@ -229,7 +209,163 @@ def verified_v1_archive(
     if len(expected_files) != 36:
         raise ValueError("archive manifest contains invalid or duplicate NPZ entries")
     _validate_month_coverage(list(expected_files))
+    return manifest, archive_contract, expected_files
 
+
+def _verify_v1_npz_files(
+    paths: list[Path],
+    expected_files: Mapping[str, Mapping[str, Any]],
+) -> None:
+    actual_names = [path.name for path in paths]
+    if len(actual_names) != len(set(actual_names)):
+        raise ValueError("expanded v1_legacy input contains duplicate NPZ names")
+    if set(actual_names) != set(expected_files):
+        missing = sorted(set(expected_files) - set(actual_names))
+        unexpected = sorted(set(actual_names) - set(expected_files))
+        raise ValueError(
+            f"expanded NPZ file set mismatch: missing={missing}, "
+            f"unexpected={unexpected}"
+        )
+    for path in paths:
+        expected = expected_files[path.name]
+        if path.stat().st_size != int(expected["size_bytes"]):
+            raise ValueError(f"NPZ size mismatch: {path.name}")
+        if file_sha256(path) != expected["file_sha256"]:
+            raise ValueError(f"NPZ file SHA-256 mismatch: {path.name}")
+        if canonical_npz_content_sha256(path) != expected["canonical_content_sha256"]:
+            raise ValueError(f"NPZ canonical content SHA-256 mismatch: {path.name}")
+
+
+def _build_verified_v1(
+    *,
+    paths: list[Path],
+    data_dir: Path,
+    repository: Path,
+    manifest: Mapping[str, Any],
+    archive_contract: Mapping[str, Any],
+    archive_path: Path | None,
+    train_seed: int | None,
+    kaggle: bool,
+    input_mode: str,
+) -> VerifiedV1Archive:
+    data_contract = manifest["data_contract"]
+    dataset = CellDataset(
+        paths,
+        target_scale=float(data_contract["target_scale"]),
+        legacy_data_version=str(data_contract["data_version"]),
+        legacy_target_unit=str(data_contract["target_unit"]),
+    )
+    split_contract = manifest["split_contract"]
+    split_config = CellFixedSplitConfig(
+        split_seed=int(split_contract["split_seed"]),
+        validation_ratio=float(split_contract["validation_ratio"]),
+        test_ratio=float(split_contract["test_ratio"]),
+    )
+    split_csv = repository / str(split_contract["csv"])
+    split_metadata = repository / str(split_contract["metadata_json"])
+    split_manifest = load_persistent_split(
+        dataset,
+        split_csv,
+        metadata_json=split_metadata,
+        config=split_config,
+    )
+    resolved_train_seed = (
+        int(manifest["train_seed"]) if train_seed is None else int(train_seed)
+    )
+    protocol = BaselineDataProtocol.from_dataset(
+        dataset,
+        split_csv,
+        split_metadata,
+        split_config=split_config,
+        train_seed=resolved_train_seed,
+    )
+    expected_hashes = manifest["required_hashes"]
+    actual_hashes = {
+        "data_sha256": protocol.provenance.data_sha256,
+        "split_sha256": protocol.provenance.split_sha256,
+        "split_config_sha256": protocol.provenance.split_config_sha256,
+        "preprocessing_sha256": protocol.provenance.preprocessing_sha256,
+    }
+    for name, actual in actual_hashes.items():
+        if actual != expected_hashes[name]:
+            raise ValueError(
+                f"{name} mismatch: expected={expected_hashes[name]}, actual={actual}"
+            )
+    summary = {
+        "input_mode": input_mode,
+        "archive_file_sha256": archive_contract["file_sha256"],
+        "archive_file_sha256_verified": archive_path is not None,
+        "per_file_sha256_verified": True,
+        "per_file_canonical_content_sha256_verified": True,
+        "npz_count": len(paths),
+        "train_seed": resolved_train_seed,
+        **actual_hashes,
+        "cell_counts": {
+            name: len(split_manifest.cell_ids(name))
+            for name in ("train", "validation", "test")
+        },
+        "test_assignment_integrity_verified": True,
+        "test_sample_arrays_materialized": False,
+        "temporary_data_cleanup": (
+            "automatic_on_context_exit" if input_mode == "archive" else "not_applicable"
+        ),
+    }
+    return VerifiedV1Archive(
+        archive_path,
+        data_dir,
+        protocol,
+        summary,
+        kaggle,
+        input_mode,
+    )
+
+
+def _expanded_v1_directories(
+    input_root: Path,
+    expected_files: Mapping[str, Mapping[str, Any]],
+) -> list[Path]:
+    first_name = sorted(expected_files)[0]
+    candidates = {
+        path.parent.resolve()
+        for path in input_root.rglob(first_name)
+        if path.is_file()
+    }
+    matches: list[Path] = []
+    for candidate in candidates:
+        names = {path.name for path in candidate.glob("*.npz") if path.is_file()}
+        if names == set(expected_files):
+            matches.append(candidate)
+    return sorted(matches)
+
+
+@contextmanager
+def verified_v1_archive(
+    *,
+    input_root: str | Path,
+    working_root: str | Path,
+    manifest_path: str | Path,
+    repository_root: str | Path,
+    kaggle: bool = False,
+    train_seed: int | None = None,
+) -> Iterator[VerifiedV1Archive]:
+    """Verify, temporarily extract, and automatically clean the legacy archive."""
+
+    input_path = Path(input_root).resolve()
+    working_path = Path(working_root).resolve()
+    repository = Path(repository_root).resolve()
+    if kaggle:
+        _validate_kaggle_roots(input_path, working_path)
+    working_path.mkdir(parents=True, exist_ok=True)
+    archive_path = discover_v1_archive(input_path)
+    manifest, archive_contract, expected_files = _load_v1_archive_manifest(
+        manifest_path
+    )
+    if archive_path.name != archive_contract.get("file_name"):
+        raise ValueError("archive name does not match the frozen manifest")
+    if archive_path.stat().st_size != int(archive_contract.get("size_bytes", -1)):
+        raise ValueError("archive size does not match the frozen manifest")
+    if file_sha256(archive_path) != archive_contract.get("file_sha256"):
+        raise ValueError("archive SHA-256 does not match the frozen manifest")
     with TemporaryDirectory(prefix="cell-msca-v1-", dir=working_path) as directory:
         data_dir = Path(directory)
         with zipfile.ZipFile(archive_path, "r") as archive:
@@ -242,71 +378,80 @@ def verified_v1_archive(
                     while chunk := source.read(1024 * 1024):
                         target.write(chunk)
         paths = sorted(data_dir.glob("*.npz"))
-        for path in paths:
-            expected = expected_files[path.name]
-            if path.stat().st_size != int(expected["size_bytes"]):
-                raise ValueError(f"NPZ size mismatch: {path.name}")
-            if file_sha256(path) != expected["file_sha256"]:
-                raise ValueError(f"NPZ file SHA-256 mismatch: {path.name}")
-            if (
-                canonical_npz_content_sha256(path)
-                != expected["canonical_content_sha256"]
-            ):
-                raise ValueError(f"NPZ canonical content SHA-256 mismatch: {path.name}")
+        _verify_v1_npz_files(paths, expected_files)
+        yield _build_verified_v1(
+            paths=paths,
+            data_dir=data_dir,
+            repository=repository,
+            manifest=manifest,
+            archive_contract=archive_contract,
+            archive_path=archive_path,
+            train_seed=train_seed,
+            kaggle=kaggle,
+            input_mode="archive",
+        )
 
-        data_contract = manifest["data_contract"]
-        dataset = CellDataset(
-            paths,
-            target_scale=float(data_contract["target_scale"]),
-            legacy_data_version=str(data_contract["data_version"]),
-            legacy_target_unit=str(data_contract["target_unit"]),
+
+@contextmanager
+def verified_v1_input(
+    *,
+    input_root: str | Path,
+    working_root: str | Path,
+    manifest_path: str | Path,
+    repository_root: str | Path,
+    kaggle: bool = False,
+    train_seed: int | None = None,
+) -> Iterator[VerifiedV1Archive]:
+    """Verify one archive or one Kaggle-expanded 36-NPZ directory."""
+
+    input_path = Path(input_root).resolve()
+    working_path = Path(working_root).resolve()
+    repository = Path(repository_root).resolve()
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"input root does not exist: {input_path}")
+    if kaggle:
+        _validate_kaggle_roots(input_path, working_path)
+    manifest, archive_contract, expected_files = _load_v1_archive_manifest(
+        manifest_path
+    )
+    archives = sorted(
+        path.resolve()
+        for path in input_path.rglob(V1_ARCHIVE_NAME)
+        if path.is_file()
+    )
+    expanded = _expanded_v1_directories(input_path, expected_files)
+    available_modes = int(bool(archives)) + int(bool(expanded))
+    if len(archives) > 1 or len(expanded) > 1 or available_modes != 1:
+        raise RuntimeError(
+            "expected exactly one v1_legacy input mode; "
+            f"archives={len(archives)}, expanded_directories={len(expanded)}"
         )
-        split_contract = manifest["split_contract"]
-        split_config = CellFixedSplitConfig(
-            split_seed=int(split_contract["split_seed"]),
-            validation_ratio=float(split_contract["validation_ratio"]),
-            test_ratio=float(split_contract["test_ratio"]),
-        )
-        split_csv = repository / str(split_contract["csv"])
-        split_metadata = repository / str(split_contract["metadata_json"])
-        split_manifest = load_persistent_split(
-            dataset,
-            split_csv,
-            metadata_json=split_metadata,
-            config=split_config,
-        )
-        protocol = BaselineDataProtocol.from_dataset(
-            dataset,
-            split_csv,
-            split_metadata,
-            split_config=split_config,
-            train_seed=int(manifest["train_seed"]),
-        )
-        expected_hashes = manifest["required_hashes"]
-        actual_hashes = {
-            "data_sha256": protocol.provenance.data_sha256,
-            "split_sha256": protocol.provenance.split_sha256,
-            "split_config_sha256": protocol.provenance.split_config_sha256,
-            "preprocessing_sha256": protocol.provenance.preprocessing_sha256,
-        }
-        for name, actual in actual_hashes.items():
-            if actual != expected_hashes[name]:
-                raise ValueError(
-                    f"{name} mismatch: expected={expected_hashes[name]}, actual={actual}"
-                )
-        summary = {
-            "archive_file_sha256": archive_contract["file_sha256"],
-            "npz_count": len(paths),
-            **actual_hashes,
-            "cell_counts": {
-                name: len(split_manifest.cell_ids(name))
-                for name in ("train", "validation", "test")
-            },
-            "test_assignment_integrity_verified": True,
-            "test_sample_arrays_materialized": False,
-            "temporary_data_cleanup": "automatic_on_context_exit",
-        }
-        yield VerifiedV1Archive(archive_path, data_dir, protocol, summary, kaggle)
+    if archives:
+        with verified_v1_archive(
+            input_root=input_path,
+            working_root=working_path,
+            manifest_path=manifest_path,
+            repository_root=repository,
+            kaggle=kaggle,
+            train_seed=train_seed,
+        ) as verified:
+            yield verified
+        return
+
+    data_dir = expanded[0]
+    paths = sorted(data_dir.glob("*.npz"))
+    _verify_v1_npz_files(paths, expected_files)
+    yield _build_verified_v1(
+        paths=paths,
+        data_dir=data_dir,
+        repository=repository,
+        manifest=manifest,
+        archive_contract=archive_contract,
+        archive_path=None,
+        train_seed=train_seed,
+        kaggle=kaggle,
+        input_mode="expanded_npz",
+    )
 
 
 def _load_frozen_baseline_values(
