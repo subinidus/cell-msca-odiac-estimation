@@ -32,6 +32,7 @@ from numpy.typing import NDArray
 from . import baselines as _baseline_module
 from .baselines import (
     BaselineArraySplit,
+    BaselineDataProtocol,
     BaselineProvenance,
     FittedLightGBM,
     ModelContract,
@@ -80,9 +81,14 @@ PHASE6_REGISTRY_STATES = (
     "materialization_started",
     "materialized",
     "evaluating",
+    "finalizing",
     "failed",
     "completed",
 )
+PHASE6_KAGGLE_REGISTRY_ROOT = Path(
+    "/kaggle/working/.cell_msca_phase6_final_test_registry"
+)
+PHASE6_LOCAL_REGISTRY_ROOT = Path.home() / ".cell_msca_phase6_final_test_registry"
 
 
 @dataclass(frozen=True)
@@ -130,9 +136,26 @@ class FinalTestGate:
     protocol_fingerprint: str
     execution_id: str
     registry_claim_path: Path
+    bound_protocol: Any = field(repr=False, compare=False)
+    bound_protocol_type: type[Any] = field(repr=False, compare=False)
+    bound_dataset: Any = field(repr=False, compare=False)
+    bound_split: Any = field(repr=False, compare=False)
+    frozen_provenance: Mapping[str, Any]
     loaded_models: Mapping[tuple[str, int], LoadedFrozenModel]
     audit: Mapping[str, Any]
     _authority: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class StagedFinalBundle:
+    staging_root: Path
+    success_manifest: Path
+    zip_path: Path
+    receipt_path: Path
+    public_success_manifest: Path
+    public_zip_path: Path
+    public_receipt_path: Path
+    sha256_by_name: Mapping[str, str]
 
 
 ModelLoader = Callable[
@@ -211,6 +234,25 @@ def protocol_fingerprint(protocol: Any) -> str:
     """Fingerprint only the data/split/preprocessing protocol, never output paths."""
 
     return canonical_sha256(_protocol_identity(protocol))
+
+
+def _protocol_bound_objects(protocol: Any) -> tuple[Any, Any]:
+    try:
+        dataset = protocol._dataset
+        split = protocol._manifest
+    except AttributeError as error:
+        raise TypeError(
+            "Phase 6 protocol must expose its bound dataset and persistent split"
+        ) from error
+    if dataset is None or split is None:
+        raise ValueError("Phase 6 protocol dataset/split identity cannot be null")
+    return dataset, split
+
+
+def _authoritative_registry_root(*, kaggle: bool) -> Path:
+    """Return the non-configurable production registry for this execution environment."""
+
+    return PHASE6_KAGGLE_REGISTRY_ROOT if kaggle else PHASE6_LOCAL_REGISTRY_ROOT
 
 
 def deterministic_execution_id(
@@ -306,6 +348,8 @@ def _gate_identity(gate: FinalTestGate) -> dict[str, Any]:
             for model_name, seed in gate.evaluation_keys
         ],
         "execution_id": gate.execution_id,
+        "frozen_provenance": dict(gate.frozen_provenance),
+        "protocol_instance_binding": "in_process_identity_only_not_serializable",
     }
 
 
@@ -398,7 +442,8 @@ def _transition_registry(
         "claimed": {"materialization_started", "failed"},
         "materialization_started": {"materialized", "failed"},
         "materialized": {"evaluating", "failed"},
-        "evaluating": {"evaluating", "failed", "completed"},
+        "evaluating": {"evaluating", "finalizing", "failed"},
+        "finalizing": {"failed", "completed"},
         "failed": set(),
         "completed": set(),
     }
@@ -410,6 +455,23 @@ def _transition_registry(
     values.update(dict(updates or {}))
     values["state"] = state
     values[f"{state}_at_utc"] = _utc_now()
+    _atomic_write_json(claim_path, values)
+    return values
+
+
+def _update_completed_registry(
+    claim_path: Path,
+    *,
+    execution_id: str,
+    updates: Mapping[str, Any],
+) -> dict[str, Any]:
+    values = _read_registry_claim(claim_path)
+    if values.get("execution_id") != execution_id or values.get("state") != "completed":
+        raise TestEvaluationBlockedError(
+            "publish-only recovery requires the exact completed execution registry"
+        )
+    values.update(dict(updates))
+    values["registry_updated_at_utc"] = _utc_now()
     _atomic_write_json(claim_path, values)
     return values
 
@@ -639,7 +701,7 @@ def load_phase6_protocol(path: str | Path) -> dict[str, Any]:
         raise ValueError("Phase 6 final-test access contract changed")
     registry = values.get("run_registry")
     if registry != {
-        "directory_name": "cell-msca-phase6-final-test-registry",
+        "directory_name": ".cell_msca_phase6_final_test_registry",
         "states": list(PHASE6_REGISTRY_STATES),
         "claim_creation": "atomic_exclusive_create",
         "default_existing_claim_policy": "fail_closed",
@@ -884,7 +946,27 @@ def _validation_result(
         ) from error
     if count != expected_samples or not np.isfinite(minimum):
         raise ValueError("frozen validation prediction row count changed")
-    return result
+    with TemporaryDirectory(prefix="cell-msca-phase6-metric-preflight-") as directory:
+        prediction_path = Path(directory) / "validation_predictions.csv"
+        prediction_path.write_bytes(prediction_bytes)
+        metric_audit = _phase6_metrics_from_csv(prediction_path, result)
+    verified_result = dict(result)
+    verified_result["phase6_stored_metric_preflight"] = {
+        "prediction_sha256": spec.validation_prediction_sha256,
+        "relative_tolerance": PHASE6_METRIC_REL_TOL,
+        "absolute_tolerance": PHASE6_METRIC_ABS_TOL,
+        "absolute_deltas": metric_audit["metric_recalculation_absolute_deltas"],
+        "relative_deltas": metric_audit["metric_recalculation_relative_deltas"],
+        "maximum_absolute_delta": metric_audit[
+            "metric_recalculation_maximum_absolute_delta"
+        ],
+        "maximum_relative_delta": metric_audit[
+            "metric_recalculation_maximum_relative_delta"
+        ],
+        "nonfinite_rejected": True,
+        "package_manifest_prediction_and_model_hashes_remain_exact": True,
+    }
+    return verified_result
 
 
 def _validate_manifest(
@@ -1083,13 +1165,13 @@ def verify_final_test_gate(
     extraction_root: str | Path,
     allow_final_test: bool,
     protocol: Any | None = None,
-    registry_root: str | Path | None = None,
     device: str = "cpu",
     model_loader: ModelLoader | None = None,
     repository_root: str | Path | None = None,
     kaggle: bool = False,
     allow_resume_failed_run: bool = False,
     resume_execution_id: str | None = None,
+    _test_registry_root: str | Path | None = None,
 ) -> FinalTestGate:
     """Verify every frozen condition without materializing the test subset."""
 
@@ -1105,10 +1187,11 @@ def verify_final_test_gate(
         raise TestEvaluationBlockedError(
             "repository_root is required to bind the gate to an exact source Git SHA"
         )
-    if registry_root is None:
-        raise TestEvaluationBlockedError(
-            "a fixed Phase 6 run registry root is required"
+    if _test_registry_root is None and not isinstance(protocol, BaselineDataProtocol):
+        raise TypeError(
+            "production Phase 6 gate requires an actual BaselineDataProtocol instance"
         )
+    bound_dataset, bound_split = _protocol_bound_objects(protocol)
     if allow_resume_failed_run or resume_execution_id is not None:
         raise TestEvaluationBlockedError(
             "failed-run recovery is disabled; recovery_allowed=false"
@@ -1268,9 +1351,16 @@ def verify_final_test_gate(
             for model_name, seed in evaluation_keys
         ],
         "execution_id": execution_id,
+        "frozen_provenance": dict(protocol_identity),
+        "protocol_instance_binding": "in_process_identity_only_not_serializable",
     }
+    authoritative_registry = (
+        Path(_test_registry_root)
+        if _test_registry_root is not None
+        else _authoritative_registry_root(kaggle=kaggle)
+    )
     registry_claim_path, _ = _claim_execution(
-        registry_root=Path(registry_root),
+        registry_root=authoritative_registry,
         execution_id=execution_id,
         output_dir=destination,
         gate_identity=gate_identity,
@@ -1288,6 +1378,8 @@ def verify_final_test_gate(
         "validation_code_git_sha_is_ancestor": True,
         "git_dirty_state_policy": "tracked_and_untracked_files",
         "registry_claim_path": str(registry_claim_path.resolve()),
+        "authoritative_registry_root": str(authoritative_registry.resolve()),
+        "production_registry_injection_available": False,
         "registry_claim_creation": "atomic_exclusive_create",
         "registry_existing_claim_policy": "fail_closed",
         "recovery_allowed": False,
@@ -1301,6 +1393,18 @@ def verify_final_test_gate(
         ],
         "all_model_artifact_sha256_verified": True,
         "all_models_safely_loaded_before_test_materialization": True,
+        "stored_validation_metric_preflight": [
+            {
+                "model_name": model_name,
+                "train_seed": seed,
+                **dict(
+                    loaded[(model_name, seed)].validation_result[
+                        "phase6_stored_metric_preflight"
+                    ]
+                ),
+            }
+            for model_name, seed in evaluation_keys
+        ],
         "legacy_seed42_missing_test_evaluation_field_paths": legacy_missing_test_field,
         "legacy_seed42_missing_field_policy": (
             "accepted only for the exact immutable seed-42 neural manifests; "
@@ -1327,6 +1431,11 @@ def verify_final_test_gate(
         protocol_fingerprint=frozen_protocol_fingerprint,
         execution_id=execution_id,
         registry_claim_path=registry_claim_path,
+        bound_protocol=protocol,
+        bound_protocol_type=type(protocol),
+        bound_dataset=bound_dataset,
+        bound_split=bound_split,
+        frozen_provenance=MappingProxyType(protocol_identity),
         loaded_models=MappingProxyType(loaded),
         audit=MappingProxyType(audit),
         _authority=_PHASE6_GATE_AUTHORITY,
@@ -1341,8 +1450,21 @@ def _validate_executable_gate(protocol: Any, gate: FinalTestGate) -> dict[str, A
 
     if gate._authority is not _PHASE6_GATE_AUTHORITY:
         raise TestEvaluationBlockedError("Phase 6 execution requires a verified gate")
+    if protocol is not gate.bound_protocol:
+        raise TestEvaluationBlockedError(
+            "gate is bound to a different in-process protocol instance"
+        )
+    if type(protocol) is not gate.bound_protocol_type:
+        raise TestEvaluationBlockedError("gate protocol runtime type changed")
+    dataset, split = _protocol_bound_objects(protocol)
+    if dataset is not gate.bound_dataset:
+        raise TestEvaluationBlockedError("gate protocol dataset object identity changed")
+    if split is not gate.bound_split:
+        raise TestEvaluationBlockedError("gate protocol split object identity changed")
     _validate_protocol_provenance(protocol, gate.config)
     identity = _protocol_identity(protocol)
+    if identity != dict(gate.frozen_provenance):
+        raise TestEvaluationBlockedError("gate frozen provenance changed")
     if protocol_fingerprint(protocol) != gate.protocol_fingerprint:
         raise TestEvaluationBlockedError("gate and supplied frozen protocol differ")
     if canonical_sha256(dict(gate.config)) != gate.config_canonical_sha256:
@@ -1589,34 +1711,228 @@ def _verify_prediction_alignment(
     return reference_cells, reference_true, means
 
 
-def _write_final_zip(output_dir: Path) -> tuple[Path, Path, str]:
-    zip_path = output_dir.parent / f"{output_dir.name}.zip"
-    receipt_path = output_dir.parent / f"{output_dir.name}.sha256.json"
-    if zip_path.exists() or receipt_path.exists():
-        raise FileExistsError("refusing to overwrite final Phase 6 bundle or receipt")
-    temporary = zip_path.with_suffix(".zip.tmp")
-    if temporary.exists():
-        raise FileExistsError(f"temporary final ZIP already exists: {temporary}")
-    try:
-        with zipfile.ZipFile(temporary, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(output_dir.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(output_dir).as_posix())
-        os.replace(temporary, zip_path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    digest = file_sha256(zip_path)
-    write_metrics_json(
-        receipt_path,
+def _stage_final_bundle(
+    output_dir: Path,
+    *,
+    execution_id: str,
+    success_manifest: Mapping[str, Any],
+) -> StagedFinalBundle:
+    public_manifest = output_dir / "phase6_test_manifest.json"
+    public_zip = output_dir.parent / f"{output_dir.name}.zip"
+    public_receipt = output_dir.parent / f"{output_dir.name}.sha256.json"
+    if any(path.exists() for path in (public_manifest, public_zip, public_receipt)):
+        raise FileExistsError("refusing to overwrite a public Phase 6 final artifact")
+
+    staging_root = (
+        output_dir.parent / ".cell_msca_phase6_staging" / execution_id
+    )
+    if staging_root.exists():
+        raise FileExistsError(f"refusing to overwrite Phase 6 staging: {staging_root}")
+    staging_root.mkdir(parents=True, exist_ok=False)
+    staged_manifest = staging_root / "phase6_test_manifest.json.staged"
+    staged_zip = staging_root / f"{output_dir.name}.zip.staged"
+    staged_receipt = staging_root / f"{output_dir.name}.sha256.json.staged"
+    _atomic_write_json(staged_manifest, success_manifest)
+    with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if path.is_file() and path.name != "phase6_failure_manifest.json":
+                archive.write(path, path.relative_to(output_dir).as_posix())
+        archive.write(staged_manifest, "phase6_test_manifest.json")
+    zip_sha256 = file_sha256(staged_zip)
+    _atomic_write_json(
+        staged_receipt,
         {
             "artifact_classification": "final-test",
-            "file_name": zip_path.name,
-            "size_bytes": zip_path.stat().st_size,
-            "sha256": digest,
+            "execution_id": execution_id,
+            "file_name": public_zip.name,
+            "size_bytes": staged_zip.stat().st_size,
+            "sha256": zip_sha256,
         },
     )
-    return zip_path, receipt_path, digest
+    hashes = MappingProxyType(
+        {
+            "success_manifest": file_sha256(staged_manifest),
+            "zip": zip_sha256,
+            "receipt": file_sha256(staged_receipt),
+        }
+    )
+    for name, path in {
+        "success_manifest": staged_manifest,
+        "zip": staged_zip,
+        "receipt": staged_receipt,
+    }.items():
+        if file_sha256(path) != hashes[name]:
+            raise ValueError(f"staged Phase 6 {name} SHA-256 verification failed")
+    return StagedFinalBundle(
+        staging_root=staging_root,
+        success_manifest=staged_manifest,
+        zip_path=staged_zip,
+        receipt_path=staged_receipt,
+        public_success_manifest=public_manifest,
+        public_zip_path=public_zip,
+        public_receipt_path=public_receipt,
+        sha256_by_name=hashes,
+    )
+
+
+def _staged_bundle_record(bundle: StagedFinalBundle) -> dict[str, Any]:
+    return {
+        "staging_root": str(bundle.staging_root.resolve()),
+        "artifacts": {
+            "success_manifest": {
+                "staged_path": str(bundle.success_manifest.resolve()),
+                "public_path": str(bundle.public_success_manifest.resolve()),
+                "sha256": bundle.sha256_by_name["success_manifest"],
+            },
+            "zip": {
+                "staged_path": str(bundle.zip_path.resolve()),
+                "public_path": str(bundle.public_zip_path.resolve()),
+                "sha256": bundle.sha256_by_name["zip"],
+            },
+            "receipt": {
+                "staged_path": str(bundle.receipt_path.resolve()),
+                "public_path": str(bundle.public_receipt_path.resolve()),
+                "sha256": bundle.sha256_by_name["receipt"],
+            },
+        },
+    }
+
+
+def _publish_one_staged_artifact(staged: Path, public: Path) -> None:
+    public.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staged, public)
+
+
+def _publish_completed_staging(
+    claim_path: Path,
+    *,
+    execution_id: str,
+    recovery: bool,
+) -> dict[str, Any]:
+    registry = _read_registry_claim(claim_path)
+    if registry.get("state") != "completed" or registry.get("execution_id") != execution_id:
+        raise TestEvaluationBlockedError(
+            "public Phase 6 publish requires the exact completed registry"
+        )
+    staging = registry.get("staging_bundle")
+    if not isinstance(staging, Mapping) or not isinstance(
+        staging.get("artifacts"), Mapping
+    ):
+        raise TestEvaluationBlockedError("completed registry has no verified staging bundle")
+    artifacts = staging["artifacts"]
+    if set(artifacts) != {"success_manifest", "zip", "receipt"}:
+        raise TestEvaluationBlockedError("completed staging artifact set is invalid")
+    output_dir = Path(str(registry.get("output_dir", ""))).resolve()
+    expected_public_paths = {
+        "success_manifest": (output_dir / "phase6_test_manifest.json").resolve(),
+        "zip": (output_dir.parent / f"{output_dir.name}.zip").resolve(),
+        "receipt": (
+            output_dir.parent / f"{output_dir.name}.sha256.json"
+        ).resolve(),
+    }
+    expected_staging_root = (
+        output_dir.parent / ".cell_msca_phase6_staging" / execution_id
+    ).resolve()
+    if Path(str(staging.get("staging_root", ""))).resolve() != expected_staging_root:
+        raise TestEvaluationBlockedError(
+            "completed staging root differs from the claimed execution output"
+        )
+    published: dict[str, dict[str, str]] = {}
+    for name in ("success_manifest", "zip", "receipt"):
+        row = artifacts[name]
+        if not isinstance(row, Mapping):
+            raise TestEvaluationBlockedError("completed staging artifact row is invalid")
+        staged = Path(str(row["staged_path"]))
+        public = Path(str(row["public_path"]))
+        if public.resolve() != expected_public_paths[name]:
+            raise TestEvaluationBlockedError(
+                f"completed Phase 6 {name} public path differs from its claim"
+            )
+        try:
+            staged.resolve().relative_to(expected_staging_root)
+        except ValueError as error:
+            raise TestEvaluationBlockedError(
+                f"completed Phase 6 {name} staging path escapes its staging root"
+            ) from error
+        expected = _validate_sha256(row["sha256"], name=f"staging.{name}.sha256")
+        if public.exists():
+            if file_sha256(public) != expected:
+                raise TestEvaluationBlockedError(
+                    f"published Phase 6 {name} differs from completed staging SHA-256"
+                )
+        else:
+            if not staged.is_file() or file_sha256(staged) != expected:
+                raise TestEvaluationBlockedError(
+                    f"staged Phase 6 {name} is missing or was modified"
+                )
+            _publish_one_staged_artifact(staged, public)
+            if file_sha256(public) != expected:
+                raise TestEvaluationBlockedError(
+                    f"published Phase 6 {name} failed SHA-256 verification"
+                )
+        published[name] = {"path": str(public.resolve()), "sha256": expected}
+    recovery_count = int(registry.get("publish_recovery_count", 0)) + int(recovery)
+    recovery_attempt_count = int(
+        registry.get("publish_recovery_attempt_count", 0)
+    ) + int(recovery)
+    _update_completed_registry(
+        claim_path,
+        execution_id=execution_id,
+        updates={
+            "publish_status": "published",
+            "published_artifacts": published,
+            "publish_recovery_count": recovery_count,
+            "publish_recovery_attempt_count": recovery_attempt_count,
+            "publish_recovery_status": "published" if recovery else "not_requested",
+            "published_at_utc": _utc_now(),
+        },
+    )
+    return published
+
+
+def recover_completed_final_publish(
+    *,
+    execution_id: str,
+    kaggle: bool = False,
+    _test_registry_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Resume publication only; this path cannot load data or evaluate a model."""
+
+    registry_root = (
+        Path(_test_registry_root)
+        if _test_registry_root is not None
+        else _authoritative_registry_root(kaggle=kaggle)
+    )
+    claim_path = registry_root / f"{execution_id}.json"
+    try:
+        return _publish_completed_staging(
+            claim_path,
+            execution_id=execution_id,
+            recovery=True,
+        )
+    except Exception as error:
+        registry = _read_registry_claim(claim_path)
+        if (
+            registry.get("state") == "completed"
+            and registry.get("execution_id") == execution_id
+        ):
+            _update_completed_registry(
+                claim_path,
+                execution_id=execution_id,
+                updates={
+                    "publish_recovery_attempt_count": int(
+                        registry.get("publish_recovery_attempt_count", 0)
+                    )
+                    + 1,
+                    "publish_recovery_status": "failed",
+                    "publish_recovery_failed_at_utc": _utc_now(),
+                    "publish_recovery_exception": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                },
+            )
+        raise
 
 
 def execute_locked_final_test(
@@ -1918,10 +2234,24 @@ def execute_locked_final_test(
             },
             "completed_at_utc": _utc_now(),
         }
-        write_metrics_json(destination / "phase6_test_manifest.json", manifest)
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(f"{_utc_now()} aggregation_and_bootstrap_completed\n")
-        zip_path, receipt_path, zip_sha256 = _write_final_zip(destination)
+        staged = _stage_final_bundle(
+            destination,
+            execution_id=gate.execution_id,
+            success_manifest=manifest,
+        )
+        staging_record = _staged_bundle_record(staged)
+        _transition_registry(
+            gate.registry_claim_path,
+            gate,
+            state="finalizing",
+            updates={
+                "staging_bundle": staging_record,
+                "staging_sha256_verified": True,
+                "publish_status": "not_started",
+            },
+        )
         _transition_registry(
             gate.registry_claim_path,
             gate,
@@ -1931,18 +2261,21 @@ def execute_locked_final_test(
                 "test_evaluation_performed": True,
                 "completed_model_seeds": completed_keys,
                 "completed_artifacts": completed_artifacts,
-                "final_zip": {
-                    "path": str(zip_path.resolve()),
-                    "sha256": zip_sha256,
-                    "receipt_path": str(receipt_path.resolve()),
-                },
+                "staging_bundle": staging_record,
+                "staging_sha256_verified": True,
+                "publish_status": "pending",
             },
+        )
+        published = _publish_completed_staging(
+            gate.registry_claim_path,
+            execution_id=gate.execution_id,
+            recovery=False,
         )
         return {
             "output_dir": str(destination),
-            "final_zip": str(zip_path),
-            "final_zip_sha256_receipt": str(receipt_path),
-            "final_zip_sha256": zip_sha256,
+            "final_zip": published["zip"]["path"],
+            "final_zip_sha256_receipt": published["receipt"]["path"],
+            "final_zip_sha256": published["zip"]["sha256"],
             "execution_id": gate.execution_id,
             "manifest": manifest,
         }
@@ -1968,7 +2301,18 @@ def execute_locked_final_test(
         }
         try:
             registry = _read_registry_claim(gate.registry_claim_path)
-            if registry["state"] not in {"failed", "completed"}:
+            if registry["state"] == "completed":
+                _update_completed_registry(
+                    gate.registry_claim_path,
+                    execution_id=gate.execution_id,
+                    updates={
+                        "publish_status": "failed",
+                        "publish_exception_type": type(error).__name__,
+                        "publish_exception_message": str(error),
+                        "publish_failed_at_utc": _utc_now(),
+                    },
+                )
+            elif registry["state"] != "failed":
                 _transition_registry(
                     gate.registry_claim_path,
                     gate,
@@ -1996,6 +2340,7 @@ def run_locked_final_test(
     model_loader: ModelLoader | None = None,
     allow_resume_failed_run: bool = False,
     resume_execution_id: str | None = None,
+    _test_registry_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the frozen protocol; no fit or selection function is reachable here."""
 
@@ -2012,11 +2357,6 @@ def run_locked_final_test(
     config = load_phase6_protocol(config_path)
     repository = Path(repository_root).resolve()
     manifest_path = repository / str(config["data"]["archive_manifest"])
-    registry_root = (
-        Path("/kaggle/working") / str(config["run_registry"]["directory_name"])
-        if kaggle
-        else Path(working_root).resolve() / str(config["run_registry"]["directory_name"])
-    )
     with verified_v1_input(
         input_root=input_root,
         working_root=working_root,
@@ -2035,13 +2375,13 @@ def run_locked_final_test(
             extraction_root=temporary,
             allow_final_test=allow_final_test,
             protocol=verified.protocol,
-            registry_root=registry_root,
             device=device,
             model_loader=model_loader,
             repository_root=repository,
             kaggle=kaggle,
             allow_resume_failed_run=allow_resume_failed_run,
             resume_execution_id=resume_execution_id,
+            _test_registry_root=_test_registry_root,
         )
         return execute_locked_final_test(
             protocol=verified.protocol,

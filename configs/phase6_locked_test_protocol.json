@@ -86,12 +86,13 @@
     "hyperparameter_change_performed": false
   },
   "run_registry": {
-    "directory_name": "cell-msca-phase6-final-test-registry",
+    "directory_name": ".cell_msca_phase6_final_test_registry",
     "states": [
       "claimed",
       "materialization_started",
       "materialized",
       "evaluating",
+      "finalizing",
       "failed",
       "completed"
     ],

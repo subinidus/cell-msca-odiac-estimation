@@ -5,6 +5,7 @@ import contextlib
 import csv
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import types
@@ -27,31 +28,43 @@ from cell_msca.baselines import (
     evaluate_fitted_baseline,
 )
 from cell_msca.phase6 import (
+    PHASE6_KAGGLE_REGISTRY_ROOT,
+    PHASE6_LOCAL_REGISTRY_ROOT,
     PHASE6_ARTIFACT_KEYS,
     FinalTestGate,
     FrozenArtifactSpec,
     LoadedFrozenModel,
     _PHASE6_GATE_AUTHORITY,
     _aggregate_seed_metrics,
+    _authoritative_registry_root,
+    _build_parser,
     _claim_execution,
     _extract_verified_member,
     _gate_identity,
     _phase6_metrics_from_csv,
+    _protocol_identity,
     _read_registry_claim,
+    _validate_zip_inventory,
+    _validation_result,
+    _zip_bytes,
+    _zip_json,
     deterministic_execution_id,
     execute_locked_final_test,
+    frozen_artifact_specs,
     load_phase6_protocol,
     protocol_fingerprint,
+    recover_completed_final_publish,
     validate_test_structure,
     verify_final_test_gate,
 )
 from cell_msca.evaluate import MetricMismatchError, write_prediction_csv
-from cell_msca.data import canonical_sha256
+from cell_msca.data import canonical_sha256, file_sha256
 from cell_msca.target import target_transform
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "configs" / "phase6_locked_test_protocol.json"
+SEED42_ZIP = Path(os.environ.get("CELL_MSCA_SEED42_ZIP", "__not_configured__"))
 
 
 class _FrozenPredictor:
@@ -67,6 +80,7 @@ class _FrozenPredictor:
         self.offset = offset
         self.fail = fail
         self.mutate = mutate
+        self.predict_calls = 0
 
     def phase6_state_fingerprint(self) -> str:
         return hashlib.sha256(
@@ -74,6 +88,7 @@ class _FrozenPredictor:
         ).hexdigest()
 
     def predict(self, features: np.ndarray) -> BaselinePredictions:
+        self.predict_calls += 1
         if self.fail:
             raise RuntimeError("injected frozen prediction failure")
         prediction = np.full(features.shape[0], self.offset, dtype=np.float64)
@@ -106,6 +121,8 @@ class _SyntheticProtocol:
             target_scale=1.0,
         )
         self.split = split
+        self._dataset = object()
+        self._manifest = object()
         self.test_data_calls = 0
         self.fail_materialization = fail_materialization
 
@@ -271,6 +288,11 @@ def _synthetic_gate(
         protocol_fingerprint=protocol_fingerprint(protocol),
         execution_id=execution_id,
         registry_claim_path=registry_root / "pending.json",
+        bound_protocol=protocol,
+        bound_protocol_type=type(protocol),
+        bound_dataset=protocol._dataset,
+        bound_split=protocol._manifest,
+        frozen_provenance=MappingProxyType(_protocol_identity(protocol)),
         loaded_models=MappingProxyType(models),
         audit=MappingProxyType({
             "status": "passed",
@@ -305,10 +327,24 @@ class Phase6ProtocolTests(unittest.TestCase):
                 "materialization_started",
                 "materialized",
                 "evaluating",
+                "finalizing",
                 "failed",
                 "completed",
             ],
         )
+
+    def test_production_registry_is_fixed_and_cli_cannot_override_it(self) -> None:
+        self.assertEqual(
+            _authoritative_registry_root(kaggle=True),
+            PHASE6_KAGGLE_REGISTRY_ROOT,
+        )
+        self.assertEqual(
+            _authoritative_registry_root(kaggle=False),
+            PHASE6_LOCAL_REGISTRY_ROOT,
+        )
+        destinations = {action.dest for action in _build_parser()._actions}
+        self.assertNotIn("registry_root", destinations)
+        self.assertNotIn("test_registry_root", destinations)
 
     def test_missing_and_duplicate_artifact_keys_are_rejected(self) -> None:
         values = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -351,9 +387,26 @@ class Phase6ProtocolTests(unittest.TestCase):
                     extraction_root=root / "models",
                     allow_final_test=True,
                     protocol=None,
-                    registry_root=root / "registry",
+                    _test_registry_root=root / "registry",
                     repository_root=root,
                 )
+
+    def test_production_gate_requires_actual_baseline_data_protocol(self) -> None:
+        protocol = _SyntheticProtocol(_synthetic_test_split())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(TypeError, "actual BaselineDataProtocol"):
+                verify_final_test_gate(
+                    config_path=root / "must-not-be-read.json",
+                    phase5a_zip=root / "must-not-be-read-phase5a.zip",
+                    seed42_zip=root / "must-not-be-read-seed42.zip",
+                    output_dir=root / "output",
+                    extraction_root=root / "models",
+                    allow_final_test=True,
+                    protocol=protocol,
+                    repository_root=root,
+                )
+        self.assertEqual(protocol.test_data_calls, 0)
 
     def test_failed_run_resume_request_is_always_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -367,7 +420,7 @@ class Phase6ProtocolTests(unittest.TestCase):
                     extraction_root=root / "models",
                     allow_final_test=True,
                     protocol=_SyntheticProtocol(_synthetic_test_split()),
-                    registry_root=root / "registry",
+                    _test_registry_root=root / "registry",
                     repository_root=root,
                     allow_resume_failed_run=True,
                     resume_execution_id="wrong-execution-id",
@@ -387,7 +440,7 @@ class Phase6ProtocolTests(unittest.TestCase):
                     extraction_root=root / "models",
                     allow_final_test=True,
                     protocol=_SyntheticProtocol(_synthetic_test_split()),
-                    registry_root=root / "registry",
+                    _test_registry_root=root / "registry",
                     repository_root=root,
                 )
 
@@ -418,7 +471,7 @@ class Phase6ProtocolTests(unittest.TestCase):
                     extraction_root=root / "models",
                     allow_final_test=True,
                     protocol=_protocol_for_frozen_config(),
-                    registry_root=root / "registry",
+                    _test_registry_root=root / "registry",
                     repository_root=ROOT,
                 )
 
@@ -451,6 +504,54 @@ class Phase6ProtocolTests(unittest.TestCase):
                         spec,
                         root,
                     )
+
+    def test_prediction_member_sha_tampering_is_rejected_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "predictions.zip"
+            member = "run/validation_predictions.csv"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(member, b"changed-prediction")
+            with zipfile.ZipFile(archive_path) as archive:
+                inventory = _validate_zip_inventory(archive, package_name="phase5a")
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    _zip_bytes(
+                        archive,
+                        inventory,
+                        member,
+                        expected_sha256="0" * 64,
+                    )
+
+    @unittest.skipUnless(SEED42_ZIP.is_file(), "immutable seed-42 ZIP is unavailable")
+    def test_actual_seed42_legacy_metric_preflight_uses_strict_tolerance(self) -> None:
+        config = load_phase6_protocol(CONFIG_PATH)
+        specs = frozen_artifact_specs(config)
+        checked = []
+        with zipfile.ZipFile(SEED42_ZIP, "r") as archive:
+            inventory = _validate_zip_inventory(archive, package_name="seed42")
+            for key in (
+                ("cell_msca_token_no_attention", 42),
+                ("cell_msca_bidirectional", 42),
+            ):
+                spec = specs[key]
+                manifest = _zip_json(
+                    archive,
+                    inventory,
+                    spec.manifest_path,
+                    expected_sha256=spec.manifest_sha256,
+                )
+                result = _validation_result(
+                    archive,
+                    inventory,
+                    spec,
+                    manifest,
+                    expected_samples=int(config["validation_evidence_expected_samples"]),
+                )
+                audit = result["phase6_stored_metric_preflight"]
+                self.assertEqual(audit["relative_tolerance"], 1e-12)
+                self.assertEqual(audit["absolute_tolerance"], 1e-12)
+                self.assertLessEqual(audit["maximum_absolute_delta"], 1e-12)
+                checked.append(key)
+        self.assertEqual(len(checked), 2)
 
     def test_test_structure_rejects_incomplete_cells(self) -> None:
         split = _synthetic_test_split()
@@ -498,11 +599,9 @@ class Phase6ProtocolTests(unittest.TestCase):
         summary = _aggregate_seed_metrics(rows, ddof=1)
         self.assertEqual(summary["lightgbm_raw"]["aggregate"]["mae"]["std"], 1.0)
 
-    def test_gate_protocol_mismatch_stops_before_output_and_materialization(self) -> None:
+    def test_distinct_same_provenance_protocol_is_rejected_by_instance_identity(self) -> None:
         protocol = _SyntheticProtocol(_synthetic_test_split())
-        mismatched = _SyntheticProtocol(
-            _synthetic_test_split(), data_sha256="e" * 64
-        )
+        mismatched = _SyntheticProtocol(_synthetic_test_split())
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
@@ -511,13 +610,16 @@ class Phase6ProtocolTests(unittest.TestCase):
                 registry_root=root / "registry",
                 output_dir=output,
             )
-            with self.assertRaisesRegex(ValueError, "data_sha256 mismatch"):
+            with self.assertRaisesRegex(
+                TestEvaluationBlockedError, "different in-process protocol instance"
+            ):
                 execute_locked_final_test(
                     protocol=mismatched,
                     gate=gate,
                     output_dir=output,
                 )
             self.assertFalse(output.exists())
+            self.assertEqual(protocol.test_data_calls, 0)
             self.assertEqual(mismatched.test_data_calls, 0)
             self.assertEqual(_read_registry_claim(gate.registry_claim_path)["state"], "claimed")
 
@@ -594,6 +696,173 @@ class Phase6ProtocolTests(unittest.TestCase):
                     output_dir=root / "run-b",
                     gate_identity=_gate_identity(gate),
                 )
+
+    def test_different_working_and_output_roots_share_one_execution_claim(self) -> None:
+        protocol_a = _SyntheticProtocol(_synthetic_test_split())
+        protocol_b = _SyntheticProtocol(_synthetic_test_split())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = root / "authoritative-registry"
+            output_a = root / "working-a" / "output-a"
+            gate_a = _synthetic_gate(
+                protocol_a,
+                registry_root=registry,
+                output_dir=output_a,
+            )
+            execute_locked_final_test(
+                protocol=protocol_a,
+                gate=gate_a,
+                output_dir=output_a,
+            )
+            with self.assertRaisesRegex(
+                TestEvaluationBlockedError, "already claimed"
+            ):
+                _synthetic_gate(
+                    protocol_b,
+                    registry_root=registry,
+                    output_dir=root / "working-b" / "output-b",
+                )
+            self.assertEqual(protocol_a.test_data_calls + protocol_b.test_data_calls, 1)
+
+    def test_completed_transition_failure_keeps_public_final_artifacts_hidden(self) -> None:
+        protocol = _SyntheticProtocol(_synthetic_test_split())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            gate = _synthetic_gate(
+                protocol,
+                registry_root=root / "registry",
+                output_dir=output,
+            )
+            from cell_msca import phase6 as phase6_module
+
+            real_transition = phase6_module._transition_registry
+
+            def fail_completed(*args: object, **kwargs: object) -> object:
+                if kwargs.get("state") == "completed":
+                    raise RuntimeError("injected completed transition failure")
+                return real_transition(*args, **kwargs)
+
+            with mock.patch(
+                "cell_msca.phase6._transition_registry", side_effect=fail_completed
+            ), self.assertRaisesRegex(RuntimeError, "completed transition failure"):
+                execute_locked_final_test(
+                    protocol=protocol,
+                    gate=gate,
+                    output_dir=output,
+                )
+            registry = _read_registry_claim(gate.registry_claim_path)
+            self.assertEqual(registry["state"], "failed")
+            self.assertIn("staging_bundle", registry)
+            self.assertFalse((output / "phase6_test_manifest.json").exists())
+            self.assertFalse((root / "output.zip").exists())
+            self.assertFalse((root / "output.sha256.json").exists())
+            for row in registry["staging_bundle"]["artifacts"].values():
+                staged = Path(row["staged_path"])
+                self.assertTrue(staged.is_file())
+                self.assertEqual(file_sha256(staged), row["sha256"])
+
+    def test_publish_failure_recovers_from_completed_staging_without_re_evaluation(
+        self,
+    ) -> None:
+        protocol = _SyntheticProtocol(_synthetic_test_split())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            gate = _synthetic_gate(
+                protocol,
+                registry_root=root / "registry",
+                output_dir=output,
+            )
+            with mock.patch(
+                "cell_msca.phase6._publish_one_staged_artifact",
+                side_effect=RuntimeError("injected public rename failure"),
+            ), self.assertRaisesRegex(RuntimeError, "public rename failure"):
+                execute_locked_final_test(
+                    protocol=protocol,
+                    gate=gate,
+                    output_dir=output,
+                )
+            registry = _read_registry_claim(gate.registry_claim_path)
+            self.assertEqual(registry["state"], "completed")
+            self.assertEqual(registry["publish_status"], "failed")
+            self.assertFalse((output / "phase6_test_manifest.json").exists())
+            self.assertFalse((root / "output.zip").exists())
+            calls_before = sum(
+                loaded.model.predict_calls for loaded in gate.loaded_models.values()
+            )
+            with mock.patch(
+                "cell_msca.phase6.evaluate_fitted_baseline",
+                side_effect=AssertionError("publish recovery cannot evaluate"),
+            ), mock.patch(
+                "cell_msca.phase6._phase6_metrics_from_csv",
+                side_effect=AssertionError("publish recovery cannot calculate metrics"),
+            ), mock.patch(
+                "cell_msca.baselines.fit_lightgbm_baseline",
+                side_effect=AssertionError("publish recovery cannot train"),
+            ), mock.patch(
+                "cell_msca.train.fit_cell_msca",
+                side_effect=AssertionError("publish recovery cannot train"),
+            ):
+                published = recover_completed_final_publish(
+                    execution_id=gate.execution_id,
+                    _test_registry_root=root / "registry",
+                )
+            calls_after = sum(
+                loaded.model.predict_calls for loaded in gate.loaded_models.values()
+            )
+            self.assertEqual(calls_before, 9)
+            self.assertEqual(calls_after, calls_before)
+            self.assertEqual(protocol.test_data_calls, 1)
+            self.assertTrue(Path(published["success_manifest"]["path"]).is_file())
+            self.assertTrue(Path(published["zip"]["path"]).is_file())
+            self.assertTrue(Path(published["receipt"]["path"]).is_file())
+            registry = _read_registry_claim(gate.registry_claim_path)
+            self.assertEqual(registry["publish_status"], "published")
+            self.assertEqual(registry["publish_recovery_count"], 1)
+            self.assertEqual(registry["publish_recovery_attempt_count"], 1)
+            self.assertEqual(registry["publish_recovery_status"], "published")
+
+    def test_publish_recovery_rejects_modified_staging_zip(self) -> None:
+        protocol = _SyntheticProtocol(_synthetic_test_split())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            gate = _synthetic_gate(
+                protocol,
+                registry_root=root / "registry",
+                output_dir=output,
+            )
+            with mock.patch(
+                "cell_msca.phase6._publish_one_staged_artifact",
+                side_effect=RuntimeError("injected public rename failure"),
+            ), self.assertRaises(RuntimeError):
+                execute_locked_final_test(
+                    protocol=protocol,
+                    gate=gate,
+                    output_dir=output,
+                )
+            registry = _read_registry_claim(gate.registry_claim_path)
+            staged_zip = Path(
+                registry["staging_bundle"]["artifacts"]["zip"]["staged_path"]
+            )
+            staged_zip.write_bytes(staged_zip.read_bytes() + b"tampered")
+            with self.assertRaisesRegex(
+                TestEvaluationBlockedError, "missing or was modified"
+            ):
+                recover_completed_final_publish(
+                    execution_id=gate.execution_id,
+                    _test_registry_root=root / "registry",
+                )
+            self.assertFalse((root / "output.zip").exists())
+            registry = _read_registry_claim(gate.registry_claim_path)
+            self.assertEqual(registry["state"], "completed")
+            self.assertEqual(registry["publish_recovery_attempt_count"], 1)
+            self.assertEqual(registry["publish_recovery_status"], "failed")
+            self.assertEqual(
+                registry["publish_recovery_exception"]["type"],
+                "TestEvaluationBlockedError",
+            )
 
     def test_failure_immediately_after_materialization_records_true_without_evaluation(
         self,

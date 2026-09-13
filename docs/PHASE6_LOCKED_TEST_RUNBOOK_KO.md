@@ -36,13 +36,17 @@
 
 seed-42 neural manifest는 이전 schema라 `test_evaluation_performed` 필드가 없다. 이 예외는 정확한 seed-42 ZIP hash와 두 manifest hash에만 한정되며, `test_subset_materialized=false`, Phase 5A aggregation의 closed-gate audit 및 validation prediction identity를 함께 요구한다. 다른 누락은 허용하지 않는다.
 
-실행 가능한 gate는 검증된 protocol 없이 만들 수 없다. gate에는 config 파일 SHA-256과 canonical SHA-256, protocol fingerprint, 두 validation package SHA-256, data/split/split-config/preprocessing SHA-256, 실행 source Git SHA, 9개 model/seed 목록 및 deterministic `execution_id`가 고정된다. 실행 함수는 output 디렉터리 생성이나 test materialization 전에 이 정보를 전달된 protocol과 다시 비교한다.
+실행 가능한 gate는 실제 `BaselineDataProtocol` instance 없이 만들 수 없다. gate에는 해당 protocol, 내부 dataset 및 persistent split 객체의 in-process identity와 frozen provenance를 결속한다. 실행 함수는 output 디렉터리 생성이나 test materialization 전에 `protocol is gate.bound_protocol` 및 dataset/split 객체 identity, runtime type, provenance fingerprint를 다시 검사한다. 같은 hash를 가진 별도 protocol instance도 기존 gate를 사용할 수 없다. 이 객체 결속은 직렬화 가능한 허가 토큰이 아니며 gate를 파일에 저장해 다른 process에서 재사용할 수 있다고 주장하지 않는다.
 
-`execution_id`는 output 경로를 포함하지 않는다. 같은 protocol/config, 두 package, data/split/split-config/preprocessing 및 source Git 조합은 항상 같은 ID를 만든다. 로컬에서는 지정한 working root 아래 `cell-msca-phase6-final-test-registry`, Kaggle에서는 고정 경로 `/kaggle/working/cell-msca-phase6-final-test-registry`에 atomic exclusive-create claim을 만든다. 상태는 `claimed → materialization_started → materialized → evaluating → completed`이며, 어느 단계에서든 오류가 나면 `failed`로 종료한다. output 경로를 바꿔도 동일 ID의 `claimed`, `materialized`, `failed`, `completed` claim이 있으면 기본 실행은 중단한다.
+gate에는 config 파일 SHA-256과 canonical SHA-256, protocol fingerprint, 두 validation package SHA-256, data/split/split-config/preprocessing SHA-256, 실행 source Git SHA, 9개 model/seed 목록 및 deterministic `execution_id`도 고정된다. deterministic ID의 provenance 기반 구성은 유지된다.
+
+`execution_id`는 working/output 경로를 포함하지 않는다. 같은 protocol/config, 두 package, data/split/split-config/preprocessing 및 source Git 조합은 항상 같은 ID를 만든다. production CLI에는 registry 경로 인자가 없다. 로컬 authoritative registry는 사용자 home의 `.cell_msca_phase6_final_test_registry`, Kaggle은 `/kaggle/working/.cell_msca_phase6_final_test_registry`로 고정된다. working/output root를 변경해도 registry는 바뀌지 않는다. atomic exclusive-create claim 상태는 `claimed → materialization_started → materialized → evaluating → finalizing → completed`이며, 오류가 나면 `failed`로 종료한다. output 경로를 바꿔도 동일 ID의 기존 claim이 있으면 기본 실행은 중단한다.
 
 test materialization 직전과 직후에 registry를 갱신하고, 직후에는 row/cell/month 수와 `test_subset_materialized=true`를 기록한다. 각 model/seed prediction 완료 후 파일 경로와 SHA-256을 registry에 추가한다. 오류가 발생하면 완료된 model/seed와 artifact SHA, 실패한 model/seed, 예외 유형·메시지를 `phase6_failure_manifest.json`과 registry에 남긴다. `recovery_allowed=false`가 현재 동결 정책이다. `--allow-resume-failed-run`은 명시적으로 존재하지만 별도 승인 전에는 항상 중단하며, 완료 artifact를 자동 재계산하거나 다른 protocol/output 결과와 결합하지 않는다.
 
 모든 검증을 통과하면 persistent split의 test를 실행 중 정확히 한 번 materialize한다. 이어서 2,574 cells, cell당 36개월, 총 92,664 rows인지 확인한다. 출력 경로가 이미 존재하면 빈 디렉터리여도 덮어쓰지 않는다. 중앙 registry가 없는 서로 다른 Kaggle 독립 세션까지 코드만으로 전역 차단한다고 주장하지 않는다. 세션 간 재실행 금지는 최종 execution receipt 보존과 사용자 연구 절차로 관리한다.
+
+최종 success manifest, ZIP 및 receipt는 public 이름으로 바로 쓰지 않는다. 격리된 `.cell_msca_phase6_staging/<execution_id>` 아래에서 생성하고 SHA-256을 검증한 뒤 registry `finalizing`에 기록한다. registry가 원자적으로 `completed`가 된 후에만 public 이름으로 배치한다. completed 전환이 실패하면 public success manifest/ZIP/receipt는 존재하지 않는다. completed 후 publish가 중단된 경우 `recover_completed_final_publish()`는 completed registry와 staging SHA 및 원래 claim의 output 경로를 확인해 publish를 재개한다. 이 경로는 data materialization, prediction, training 또는 metric 계산을 호출하지 않는다. 성공·실패 recovery 시도는 registry에 기록하며, 변조되거나 다른 output을 가리키는 staging artifact를 거부한다.
 
 ## 실행 명령
 
