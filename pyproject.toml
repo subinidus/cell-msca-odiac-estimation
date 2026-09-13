@@ -9,6 +9,7 @@ license = { text = "MIT" }
 [project.scripts]
 cell-msca-kaggle-validation = "cell_msca.kaggle_runner:main"
 cell-msca-phase5a = "cell_msca.phase5a:main"
+cell-msca-phase6 = "cell_msca.phase6:main"
 
 [tool.ruff]
 line-length = 99
