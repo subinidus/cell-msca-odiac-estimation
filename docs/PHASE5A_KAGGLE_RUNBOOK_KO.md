@@ -238,6 +238,13 @@ Cell-MSCA artifact에는 resolved config, manifest, environment, validation metr
 validation predictions, selected checkpoint, execution log가 포함된다. LightGBM
 diagnostic에는 prediction, metrics, environment, manifest가 포함된다.
 
+모든 신규 run은 `nonnegative_max_zero_v1`을 명시적으로 적용한다. 원 단위 최종
+예측은 `max(0, unprojected_prediction)`이며, 음수가 있었던 행은
+`validation_negative_predictions.csv`에 별도로 기록된다. metrics와 manifest에는
+projection 전 음수 개수·비율·최솟값과 실제 적용 개수가 포함된다. Phase 5A
+LightGBM run은 `fitted_model.txt`를 원자적으로 저장하고 SHA-256을 기록하며,
+재로드한 validation 예측이 저장 직전 예측과 일치하는지 확인한다.
+
 다음 중 하나면 후속 실행을 진행하지 않는다.
 
 - archive/expanded input 후보가 0개 또는 둘 이상;

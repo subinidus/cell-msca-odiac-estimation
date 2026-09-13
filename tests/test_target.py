@@ -4,7 +4,13 @@ import unittest
 
 import numpy as np
 
-from cell_msca.target import duan_smearing_factor, inverse_target, target_transform
+from cell_msca.target import (
+    NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+    duan_smearing_factor,
+    inverse_target,
+    project_nonnegative_predictions,
+    target_transform,
+)
 
 
 class TargetTransformTests(unittest.TestCase):
@@ -44,6 +50,37 @@ class TargetTransformTests(unittest.TestCase):
     def test_inverse_target_rejects_non_finite_result(self) -> None:
         with self.assertRaisesRegex(ValueError, "produced non-finite values"):
             inverse_target([1000.0], mode="median")
+
+    def test_nonnegative_projection_is_identity_without_negative_values(self) -> None:
+        values = np.asarray([0.0, 1.5, 9.0], dtype=np.float64)
+        projected, diagnostics = project_nonnegative_predictions(values)
+
+        np.testing.assert_array_equal(projected, values)
+        self.assertEqual(
+            diagnostics.prediction_support_policy,
+            NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+        )
+        self.assertEqual(diagnostics.pre_projection_negative_count, 0)
+        self.assertEqual(diagnostics.projection_applied_count, 0)
+        self.assertEqual(diagnostics.pre_projection_minimum, 0.0)
+
+    def test_nonnegative_projection_changes_only_negative_values(self) -> None:
+        values = np.asarray([-2.0, -0.25, 0.0, 3.0], dtype=np.float64)
+        original = values.copy()
+        projected, diagnostics = project_nonnegative_predictions(values)
+
+        np.testing.assert_array_equal(projected, [0.0, 0.0, 0.0, 3.0])
+        np.testing.assert_array_equal(values, original)
+        self.assertEqual(diagnostics.pre_projection_negative_count, 2)
+        self.assertEqual(diagnostics.projection_applied_count, 2)
+        self.assertEqual(diagnostics.pre_projection_negative_fraction, 0.5)
+        self.assertEqual(diagnostics.pre_projection_minimum, -2.0)
+
+    def test_nonnegative_projection_rejects_nan_and_infinity(self) -> None:
+        for values in ([0.0, np.nan], [0.0, np.inf], [0.0, -np.inf]):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    project_nonnegative_predictions(values)
 
 
 if __name__ == "__main__":

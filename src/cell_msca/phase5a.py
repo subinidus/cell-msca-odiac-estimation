@@ -7,9 +7,12 @@ materialization or test-evaluation entry point.
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
 import json
+import os
 import platform
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,13 +23,23 @@ from typing import Any, Iterator, Mapping, Sequence
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from .baselines import LightGBMConfig, evaluate_fitted_baseline, fit_lightgbm_baseline
+from .baselines import (
+    LightGBMConfig,
+    _log_prediction_pair,
+    _original_prediction_pair,
+    evaluate_fitted_baseline,
+    fit_lightgbm_baseline,
+)
 from .data import canonical_sha256, file_sha256
 from .evaluate import (
+    BASELINE_RESULT_SCHEMA_VERSION,
+    LEGACY_BASELINE_RESULT_SCHEMA_VERSION,
     read_prediction_csv,
     verify_baseline_result_from_prediction_csv,
+    verify_legacy_projection_identity_from_prediction_csv,
     write_metrics_json,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from .kaggle_runner import (
     GitIdentity,
@@ -35,12 +48,14 @@ from .kaggle_runner import (
     run_kaggle_validation,
 )
 from .metrics import METRIC_NAMES
+from .target import NONNEGATIVE_PREDICTION_SUPPORT_POLICY
 from .v1_validation import VerifiedV1Archive, verified_v1_input
 
 PHASE5A_CONFIG_SCHEMA_VERSION = "cell_msca.phase5a_validation_robustness.v1"
 PHASE5A_ASSIGNMENT_SCHEMA_VERSION = "cell_msca.phase5a_assignment.v1"
-PHASE5A_RUN_SCHEMA_VERSION = "cell_msca.phase5a_validation_run.v1"
-PHASE5A_SELECTION_SCHEMA_VERSION = "cell_msca.phase5a_lightgbm_selection.v1"
+LEGACY_PHASE5A_RUN_SCHEMA_VERSION = "cell_msca.phase5a_validation_run.v1"
+PHASE5A_RUN_SCHEMA_VERSION = "cell_msca.phase5a_validation_run.v2"
+PHASE5A_SELECTION_SCHEMA_VERSION = "cell_msca.phase5a_lightgbm_selection.v2"
 PHASE5A_AGGREGATION_SCHEMA_VERSION = "cell_msca.phase5a_aggregation.v1"
 LIGHTGBM_CANDIDATES = ("lightgbm_raw", "lightgbm_log1p")
 NEURAL_CANDIDATES = ("cell_msca_bidirectional", "cell_msca_token_no_attention")
@@ -55,6 +70,11 @@ _LIGHTGBM_CANDIDATE_RESULT_FIELDS = frozenset(
         "configuration_sha256",
         "manifest_sha256",
         "prediction_sha256",
+        "prediction_support_policy",
+        "pre_projection_negative_count",
+        "pre_projection_negative_fraction",
+        "pre_projection_minimum",
+        "projection_applied_count",
     }
 )
 
@@ -121,6 +141,11 @@ def load_phase5a_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("Phase 5A stage must be validation_only")
     if values.get("allowed_materialized_splits") != ["train", "validation"]:
         raise ValueError("Phase 5A may materialize train and validation only")
+    if (
+        values.get("prediction_support_policy")
+        != NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+    ):
+        raise ValueError("Phase 5A prediction support policy changed")
     seeds = values.get("seeds")
     if not isinstance(seeds, dict):
         raise ValueError("Phase 5A config requires seeds")
@@ -425,6 +450,100 @@ def _lightgbm_iteration_summary(
     }
 
 
+def _support_fields(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "prediction_support_policy": result["prediction_support_policy"],
+        "pre_projection_negative_count": result[
+            "pre_projection_negative_count"
+        ],
+        "pre_projection_negative_fraction": result[
+            "pre_projection_negative_fraction"
+        ],
+        "pre_projection_minimum": result["pre_projection_minimum"],
+        "projection_applied_count": result["projection_applied_count"],
+    }
+
+
+def _save_and_verify_lightgbm_model(
+    path: str | Path,
+    *,
+    fitted: Any,
+    validation_features: NDArray[np.float64],
+    expected_final_prediction: NDArray[np.float64],
+) -> dict[str, Any]:
+    """Atomically save a fitted LightGBM booster and verify its predictions."""
+
+    destination = Path(path)
+    if destination.exists():
+        raise FileExistsError(f"refusing to overwrite LightGBM model: {destination}")
+    booster = getattr(fitted.estimator, "booster_", None)
+    if booster is None or not callable(getattr(booster, "save_model", None)):
+        raise RuntimeError("fitted LightGBM estimator does not expose booster_.save_model")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        booster.save_model(
+            str(temporary),
+            num_iteration=int(fitted.contract.best_iteration),
+        )
+        if not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise RuntimeError("LightGBM model serialization produced no artifact")
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+    lightgbm = importlib.import_module("lightgbm")
+    reloaded = lightgbm.Booster(model_file=str(destination))
+    reloaded_native = np.asarray(
+        reloaded.predict(np.asarray(validation_features, dtype=np.float64)),
+        dtype=np.float64,
+    ).ravel()
+    if fitted.target_space == "log":
+        reloaded_predictions = _log_prediction_pair(
+            reloaded_native,
+            scale=fitted.contract.target_scale,
+            mode=fitted.contract.inverse_mode,
+            smearing_factor=fitted.contract.smearing_factor,
+        )
+    elif fitted.target_space == "original":
+        reloaded_predictions = _original_prediction_pair(
+            reloaded_native,
+            target_scale=fitted.contract.target_scale,
+            model_name=fitted.contract.model_name,
+        )
+    else:
+        raise RuntimeError(f"unsupported fitted LightGBM target_space: {fitted.target_space}")
+    expected = np.asarray(expected_final_prediction, dtype=np.float64).ravel()
+    if expected.shape != reloaded_predictions.pred_original.shape or not np.allclose(
+        reloaded_predictions.pred_original,
+        expected,
+        rtol=1e-12,
+        atol=1e-12,
+    ):
+        raise RuntimeError("reloaded LightGBM validation predictions do not match")
+    maximum_absolute_difference = float(
+        np.max(np.abs(reloaded_predictions.pred_original - expected))
+    )
+    return {
+        "model_artifact": destination.name,
+        "model_sha256": file_sha256(destination),
+        "model_reload_validation_prediction_match": True,
+        "model_reload_maximum_absolute_prediction_difference": (
+            maximum_absolute_difference
+        ),
+        "model_saved_best_iteration": int(fitted.contract.best_iteration),
+    }
+
+
 def _ensure_full_validation_allowed(
     values: Mapping[str, Any],
     allow_full_validation: bool,
@@ -539,6 +658,7 @@ def run_phase5a_lightgbm(
         configured_n_estimators=upper_bound,
     )
     prediction_path = output_dir / "validation_predictions.csv"
+    diagnostic_path = output_dir / "validation_negative_predictions.csv"
     metrics_path = output_dir / "validation_metrics.json"
     manifest_path = output_dir / "run_manifest.json"
     environment_path = output_dir / "environment.json"
@@ -550,7 +670,21 @@ def run_phase5a_lightgbm(
         y_pred_log=evaluation.predictions.pred_log,
         cell_ids=data.validation.cell_ids,
     )
+    write_prediction_support_diagnostic_csv(
+        diagnostic_path,
+        y_true_original=data.validation.target_original,
+        unprojected_prediction=evaluation.predictions.unprojected_original,
+        final_prediction=evaluation.predictions.pred_original,
+        cell_ids=data.validation.cell_ids,
+        month_ids=getattr(data.validation, "month_ids", None),
+    )
     verify_baseline_result_from_prediction_csv(prediction_path, result)
+    model_artifact = _save_and_verify_lightgbm_model(
+        output_dir / "fitted_model.txt",
+        fitted=fitted,
+        validation_features=data.validation.features,
+        expected_final_prediction=evaluation.predictions.pred_original,
+    )
     write_metrics_json(
         metrics_path,
         {
@@ -558,6 +692,7 @@ def run_phase5a_lightgbm(
             "artifact_classification": "validation-only",
             "prediction_metric_verification": "passed_including_spearman",
             "actual_iterations": iteration_summary["actual_iterations"],
+            **_support_fields(result),
             "result": result,
         },
     )
@@ -595,6 +730,9 @@ def run_phase5a_lightgbm(
             ),
             **iteration_summary,
             "selection_metric": "validation_original_unit_mae",
+            **_support_fields(result),
+            "negative_prediction_diagnostic_csv": diagnostic_path.name,
+            **model_artifact,
             "allowed_materialized_splits": ["train", "validation"],
             "test_subset_materialized": False,
             "test_evaluation_performed": False,
@@ -650,6 +788,37 @@ def load_stored_validation_artifact(path: str | Path) -> StoredValidationArtifac
     )
     if manifest_config != result["config_sha256"]:
         raise ValueError("manifest/result configuration hash mismatch")
+    schema_version = result.get("schema_version")
+    if schema_version == LEGACY_BASELINE_RESULT_SCHEMA_VERSION:
+        manifest = {
+            **manifest,
+            **verify_legacy_projection_identity_from_prediction_csv(prediction_path),
+        }
+    elif schema_version == BASELINE_RESULT_SCHEMA_VERSION:
+        expected_support = _support_fields(result)
+        for field_name, expected_value in expected_support.items():
+            if manifest.get(field_name) != expected_value:
+                raise ValueError(
+                    f"manifest/result prediction support mismatch: {field_name}"
+                )
+    else:
+        raise ValueError("unsupported stored baseline result schema_version")
+    if manifest.get("schema_version") == PHASE5A_RUN_SCHEMA_VERSION:
+        model_artifact_name = manifest.get("model_artifact")
+        if (
+            not isinstance(model_artifact_name, str)
+            or Path(model_artifact_name).name != model_artifact_name
+        ):
+            raise ValueError("Phase 5A LightGBM manifest model_artifact is invalid")
+        model_artifact_path = directory / model_artifact_name
+        if not model_artifact_path.is_file():
+            raise FileNotFoundError(
+                f"Phase 5A LightGBM model artifact is missing: {model_artifact_path}"
+            )
+        if file_sha256(model_artifact_path) != manifest.get("model_sha256"):
+            raise ValueError("Phase 5A LightGBM model SHA-256 mismatch")
+        if manifest.get("model_reload_validation_prediction_match") is not True:
+            raise ValueError("Phase 5A LightGBM model reload was not verified")
     return StoredValidationArtifact(
         directory,
         manifest_path,
@@ -778,6 +947,50 @@ def _validated_lightgbm_candidate_results(
             "prediction_sha256",
         ):
             _selection_sha256(row[field], field=f"{model_name}.{field}")
+        support_fields = {
+            field: row[field]
+            for field in (
+                "prediction_support_policy",
+                "pre_projection_negative_count",
+                "pre_projection_negative_fraction",
+                "pre_projection_minimum",
+                "projection_applied_count",
+            )
+        }
+        if support_fields["prediction_support_policy"] != (
+            NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+        ):
+            raise ValueError("LightGBM candidate prediction support policy changed")
+        if isinstance(
+            support_fields["pre_projection_negative_count"], bool
+        ) or not isinstance(support_fields["pre_projection_negative_count"], int):
+            raise ValueError("LightGBM candidate negative count must be an integer")
+        if isinstance(support_fields["projection_applied_count"], bool) or not isinstance(
+            support_fields["projection_applied_count"], int
+        ):
+            raise ValueError("LightGBM candidate projection count must be an integer")
+        if support_fields["pre_projection_negative_count"] < 0:
+            raise ValueError("LightGBM candidate negative count must be nonnegative")
+        if support_fields["projection_applied_count"] != support_fields[
+            "pre_projection_negative_count"
+        ]:
+            raise ValueError("LightGBM candidate projection diagnostics disagree")
+        for field in (
+            "pre_projection_negative_fraction",
+            "pre_projection_minimum",
+        ):
+            if not isinstance(support_fields[field], Real) or not np.isfinite(
+                float(support_fields[field])
+            ):
+                raise ValueError(f"LightGBM candidate {field} must be finite")
+        fraction = float(support_fields["pre_projection_negative_fraction"])
+        minimum = float(support_fields["pre_projection_minimum"])
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("LightGBM candidate negative fraction is invalid")
+        if (support_fields["pre_projection_negative_count"] == 0) != (
+            minimum >= 0.0
+        ):
+            raise ValueError("LightGBM candidate negative minimum/count disagree")
         expected_config_sha256 = canonical_sha256(
             _lightgbm_config(master, model_name=model_name).to_dict(
                 train_seed=42,
@@ -849,6 +1062,7 @@ def freeze_lightgbm_convergence_selection(
             "configuration_sha256": artifact.result["config_sha256"],
             "manifest_sha256": file_sha256(artifact.manifest_path),
             "prediction_sha256": file_sha256(artifact.prediction_path),
+            **_support_fields(artifact.result),
         }
     selected_model = min(
         LIGHTGBM_CANDIDATES,
@@ -862,6 +1076,7 @@ def freeze_lightgbm_convergence_selection(
         "schema_version": PHASE5A_SELECTION_SCHEMA_VERSION,
         "stage": "validation_only",
         "selection_metric": "validation_original_unit_mae",
+        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
         "tie_break_order": list(LIGHTGBM_CANDIDATES),
         "selected_model_name": selected_model,
         "selected_parameters": values["lightgbm_convergence"]["parameters"],
@@ -900,6 +1115,11 @@ def load_lightgbm_selection(
         raise ValueError("LightGBM selection indicates a test evaluation")
     if selection.get("selection_metric") != "validation_original_unit_mae":
         raise ValueError("LightGBM selection metric changed")
+    if (
+        selection.get("prediction_support_policy")
+        != NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+    ):
+        raise ValueError("LightGBM selection prediction support policy changed")
     if selection.get("phase5a_config_sha256") != file_sha256(config_path):
         raise ValueError("LightGBM selection/config SHA-256 mismatch")
     if selection.get("required_hashes") != master["required_hashes"]:
@@ -1160,6 +1380,10 @@ def aggregate_phase5a_results(
         )
         if round(actual_mae, 6) != float(reference_mae[model_name]):
             raise ValueError(f"seed 42 reference MAE mismatch for {model_name}")
+        if artifact.manifest.get("projection_identity_verified") is not True:
+            raise ValueError(
+                f"seed 42 artifact did not pass projection identity: {model_name}"
+            )
 
     selected_lightgbm = str(selection["selected_model_name"])
     model_artifacts: dict[str, list[StoredValidationArtifact]] = {
@@ -1321,6 +1545,9 @@ def aggregate_phase5a_results(
             "new_results_git_sha": expected_new_git_sha,
             "prediction_alignment_verified": True,
             "prediction_metrics_recalculated": True,
+            "seed42_projection_identity_verified": {
+                model_name: True for model_name in seed42_required
+            },
             "complete_cell_rows": int(bootstrap["rows_per_cell"]),
             "test_subset_materialized": False,
             "test_evaluation_performed": False,

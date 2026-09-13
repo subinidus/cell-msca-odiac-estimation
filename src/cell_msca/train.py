@@ -21,6 +21,7 @@ from .baselines import (
     BaselinePredictions,
     ModelContract,
     TuningData,
+    _log_prediction_pair,
     _validated_feature_count,
 )
 from .data import STREAM_A_FEATURES, STREAM_B_FEATURES, canonical_sha256
@@ -31,7 +32,7 @@ from .neural_baselines import (
     _resolve_torch_device,
     fit_log_neural_model,
 )
-from .target import inverse_target
+from .target import NONNEGATIVE_PREDICTION_SUPPORT_POLICY
 
 CELL_MSCA_CHECKPOINT_SCHEMA_VERSION = "cell_msca.selected_checkpoint.v1"
 GIT_DIRTY_STATE_POLICY = "tracked_and_untracked_files"
@@ -100,6 +101,7 @@ class CellMSCATrainingConfig:
             "checkpoint_metric": "median_inverse_validation_original_unit_mae",
             "inverse_selection": "post_checkpoint_validation_original_unit_mae",
             "duan_residual_source": "train_only",
+            "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
             "train_seed": train_seed,
             "target_transform": "log1p",
             "target_scale": target_scale,
@@ -172,13 +174,12 @@ class FittedCellMSCA:
             device=torch.device(self.device),
             forward_batch=_cell_msca_forward,
         )
-        pred_original = inverse_target(
+        return _log_prediction_pair(
             pred_log,
             scale=self.contract.target_scale,
             mode=self.contract.inverse_mode,
             smearing_factor=self.contract.smearing_factor,
         )
-        return BaselinePredictions(pred_original, pred_log)
 
 
 @dataclass(frozen=True)

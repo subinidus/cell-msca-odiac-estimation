@@ -5,6 +5,7 @@
     "train",
     "validation"
   ],
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "required_base_git_sha": "034712aff6670b0fdb8b272e7b9311dc9b652830",
   "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
   "execution_policy": {
@@ -127,10 +128,10 @@
       "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
       "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
       "configuration_sha256_by_variant_and_device": {
-        "token_no_attention:cpu": "fa743e20f770076baffcc884273054a8ace8b04db272d1eb87df3fddde04c088",
-        "token_no_attention:cuda": "2601e9b1875a53c651aeec4a697e2fec25344db9dc8aa1c6fc9f7ad4b7e48a8f",
-        "bidirectional:cpu": "b7736f943d18d266510d3131215e8c879601a5bbb62aaab221353022b2fa3147",
-        "bidirectional:cuda": "fc2ef18b89036d4b0f5090a321ed59336fadc4000a28f39bc03f1306a1be51f1"
+        "token_no_attention:cpu": "ae2988ea089b2d734512ba667b6a8b3f05661265d955d3a182b54f7b88e9580e",
+        "token_no_attention:cuda": "82c13107a92709e1c54c889afef27207ac27e0c6bf841d03b4016694b8c742eb",
+        "bidirectional:cpu": "293ee61fc49a8fc239a46673fc3b38e19f94fce8614711e1e29c3c82d72b233e",
+        "bidirectional:cuda": "f80a6492c65b8709a54d5aac41dbaba46840cedfde012095c286b44ab8e38fa2"
       }
     },
     "44": {
@@ -139,10 +140,10 @@
       "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
       "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
       "configuration_sha256_by_variant_and_device": {
-        "token_no_attention:cpu": "b1f03d8cfd384eb10e9b0c6113a8b468ec898b68d6451fe6af73a88126fba9b7",
-        "token_no_attention:cuda": "95a395534b005b35335d839df3848c10e8c654d29425ef39f52504301e989001",
-        "bidirectional:cpu": "37dc8ff610d15024bd660429eeb2b74784895ef6cc828b4654cd7ce821aac99c",
-        "bidirectional:cuda": "2924d4447076c9be599b963f291a48026149b6a46d8fdec6e002a2d2e6d2758a"
+        "token_no_attention:cpu": "01c508428b55cfe92ef79e7d8f0eddf8c7e6a1dea7edd409b1b3306e8b42ebf5",
+        "token_no_attention:cuda": "f821d8ecc22e802a334ddaf64575b42dbac26cf46efe49d2426d8b8965a2088a",
+        "bidirectional:cpu": "7008f04eb20544f04448ac3ea1d1dfe0dda165f4d490cff4258abb295b7c0958",
+        "bidirectional:cuda": "e7bc559019188478f8e453778332f7c0108dda101cab35226bb36f8b58b3fc9e"
       }
     }
   },

@@ -38,6 +38,7 @@ from .evaluate import (
     verify_baseline_result_from_prediction_csv,
     write_metrics_json,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from .experiment import BaselineExperimentConfig, load_baseline_experiment_config
 from .kaggle_runner import (
@@ -47,6 +48,7 @@ from .kaggle_runner import (
 )
 from .neural_baselines import ConcatMLPConfig, fit_concat_mlp
 from .splits import CellFixedSplitConfig, load_persistent_split
+from .target import NONNEGATIVE_PREDICTION_SUPPORT_POLICY
 
 V1_ARCHIVE_MANIFEST_SCHEMA_VERSION = "cell_msca.v1_legacy_archive_manifest.v1"
 BASELINE_ADAPTER_SCHEMA_VERSION = "cell_msca.baseline_experiment.v1"
@@ -463,6 +465,11 @@ def _load_frozen_baseline_values(
         raise ValueError("unsupported frozen baseline configuration")
     if values.get("allowed_materialized_splits") != ["train", "validation"]:
         raise ValueError("frozen baseline config must allow train and validation only")
+    if (
+        values.get("prediction_support_policy")
+        != NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+    ):
+        raise ValueError("frozen baseline prediction support policy changed")
     required_hashes = values.get("required_hashes")
     if not isinstance(required_hashes, dict):
         raise ValueError("frozen baseline config requires exact hashes")
@@ -600,6 +607,7 @@ def run_frozen_baseline_validation(
     selection = _fit_single_baseline(data, config, model_name)
     evaluation = selection.validation_evaluation
     prediction_path = output_dir / "validation_predictions.csv"
+    diagnostic_path = output_dir / "validation_negative_predictions.csv"
     metrics_path = output_dir / "validation_metrics.json"
     manifest_path = output_dir / "run_manifest.json"
     environment_path = output_dir / "environment.json"
@@ -611,12 +619,35 @@ def run_frozen_baseline_validation(
         y_pred_log=evaluation.predictions.pred_log,
         cell_ids=data.validation.cell_ids,
     )
+    write_prediction_support_diagnostic_csv(
+        diagnostic_path,
+        y_true_original=data.validation.target_original,
+        unprojected_prediction=evaluation.predictions.unprojected_original,
+        final_prediction=evaluation.predictions.pred_original,
+        cell_ids=data.validation.cell_ids,
+        month_ids=data.validation.month_ids,
+    )
     verify_baseline_result_from_prediction_csv(prediction_path, evaluation.result)
     write_metrics_json(
         metrics_path,
         {
             "artifact_classification": "validation-only",
             "prediction_metric_verification": "passed_including_spearman",
+            "prediction_support_policy": evaluation.result[
+                "prediction_support_policy"
+            ],
+            "pre_projection_negative_count": evaluation.result[
+                "pre_projection_negative_count"
+            ],
+            "pre_projection_negative_fraction": evaluation.result[
+                "pre_projection_negative_fraction"
+            ],
+            "pre_projection_minimum": evaluation.result[
+                "pre_projection_minimum"
+            ],
+            "projection_applied_count": evaluation.result[
+                "projection_applied_count"
+            ],
             "result": evaluation.result,
         },
     )
@@ -643,8 +674,25 @@ def run_frozen_baseline_validation(
             "split_seed": provenance.split_seed,
             "train_seed": provenance.train_seed,
             "selection_metric": "validation_original_unit_mae",
+            "prediction_support_policy": evaluation.result[
+                "prediction_support_policy"
+            ],
+            "pre_projection_negative_count": evaluation.result[
+                "pre_projection_negative_count"
+            ],
+            "pre_projection_negative_fraction": evaluation.result[
+                "pre_projection_negative_fraction"
+            ],
+            "pre_projection_minimum": evaluation.result[
+                "pre_projection_minimum"
+            ],
+            "projection_applied_count": evaluation.result[
+                "projection_applied_count"
+            ],
+            "negative_prediction_diagnostic_csv": diagnostic_path.name,
             "allowed_materialized_splits": ["train", "validation"],
             "test_subset_materialized": False,
+            "test_evaluation_performed": False,
             "runtime_versions": environment,
             "completion_time_utc": _utc_now(),
             "validation_metrics": evaluation.result,

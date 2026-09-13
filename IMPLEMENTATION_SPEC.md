@@ -373,6 +373,17 @@ Bias=\frac1N\sum_i(\hat y_i-y_i).
 
 Original-unit MAE, RMSE, and R2 are primary. Log-space metrics and Spearman are secondary. Hotspot recall, top-10% classification, ROC-AUC, PR-AUC, and policy hotspot maps are excluded from the paper-facing evaluator.
 
+The paper-facing target support is nonnegative. Every model therefore applies the
+explicit, versioned policy `nonnegative_max_zero_v1` to its final original-unit
+prediction: `final_prediction = max(0, unprojected_prediction)`. Finite-value
+validation occurs before projection, the true target is never altered, and every
+result records the number, fraction, and minimum of pre-projection negative values.
+For original-target models, secondary log predictions are computed from the projected
+original prediction. For log-target models, the native log prediction is retained for
+log-space evaluation and only its original-unit inverse is projected. All
+original-unit validation decisions, including early stopping, checkpoint selection,
+median/Duan inverse selection, and final model selection, use this same policy.
+
 ### 7.4 Uncertainty
 
 Bootstrap complete cells rather than individual cell-month samples. Original-unit predictions and targets must be passed to the original-unit bootstrap. Log-space intervals must be separately named and stored.

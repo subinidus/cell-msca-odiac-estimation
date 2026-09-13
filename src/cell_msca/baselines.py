@@ -32,7 +32,14 @@ from .splits import (
     SplitManifest,
     load_persistent_split,
 )
-from .target import duan_smearing_factor, inverse_target, target_transform
+from .target import (
+    NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+    PredictionSupportDiagnostics,
+    duan_smearing_factor,
+    inverse_target,
+    project_nonnegative_predictions,
+    target_transform,
+)
 
 LIGHTGBM_MODEL_NAMES = (
     "lightgbm_raw",
@@ -58,12 +65,18 @@ class BaselineArraySplit:
     target_original: NDArray[np.float64]
     target_log: NDArray[np.float64]
     cell_ids: NDArray[np.str_]
+    month_ids: NDArray[np.str_] | None = None
 
     def __post_init__(self) -> None:
         features = np.asarray(self.features, dtype=np.float64)
         target_original = np.asarray(self.target_original, dtype=np.float64).ravel()
         target_log = np.asarray(self.target_log, dtype=np.float64).ravel()
         cell_ids = np.asarray(self.cell_ids, dtype=str).ravel()
+        month_ids = (
+            None
+            if self.month_ids is None
+            else np.asarray(self.month_ids, dtype=str).ravel()
+        )
         expected_features = len(STREAM_A_FEATURES) + len(STREAM_B_FEATURES)
         if features.ndim != 2 or features.shape[1] != expected_features:
             raise ValueError(
@@ -77,6 +90,8 @@ class BaselineArraySplit:
         }
         if len(lengths) != 1 or not lengths or features.shape[0] == 0:
             raise ValueError("baseline split arrays must have one non-zero sample count")
+        if month_ids is not None and month_ids.size != features.shape[0]:
+            raise ValueError("month_ids length does not match baseline samples")
         if not np.all(np.isfinite(features)):
             raise ValueError("baseline features must contain only finite values")
         if not np.all(np.isfinite(target_original)) or np.any(target_original < 0.0):
@@ -87,6 +102,7 @@ class BaselineArraySplit:
         object.__setattr__(self, "target_original", target_original)
         object.__setattr__(self, "target_log", target_log)
         object.__setattr__(self, "cell_ids", cell_ids)
+        object.__setattr__(self, "month_ids", month_ids)
 
     @property
     def n_samples(self) -> int:
@@ -249,6 +265,7 @@ class BaselineDataProtocol:
         target_original = np.empty(n_samples, dtype=np.float64)
         target_log = np.empty(n_samples, dtype=np.float64)
         cell_ids = np.empty(n_samples, dtype=object)
+        month_ids = np.empty(n_samples, dtype=object)
         for output_index, dataset_index in enumerate(indices):
             sample = self._dataset[dataset_index]
             features[output_index] = np.concatenate(
@@ -257,12 +274,14 @@ class BaselineDataProtocol:
             target_original[output_index] = sample["target_original"]
             target_log[output_index] = sample["target_log"]
             cell_ids[output_index] = sample["cell_id"]
+            month_ids[output_index] = sample["month_id"]
         return BaselineArraySplit(
             name=split,
             features=features,
             target_original=target_original,
             target_log=target_log,
             cell_ids=cell_ids.astype(str),
+            month_ids=month_ids.astype(str),
         )
 
 
@@ -270,6 +289,8 @@ class BaselineDataProtocol:
 class BaselinePredictions:
     pred_original: NDArray[np.float64]
     pred_log: NDArray[np.float64]
+    unprojected_original: NDArray[np.float64] | None = None
+    support_diagnostics: PredictionSupportDiagnostics | None = None
 
     def __post_init__(self) -> None:
         pred_original = np.asarray(self.pred_original, dtype=np.float64).ravel()
@@ -278,8 +299,27 @@ class BaselinePredictions:
             raise ValueError("original/log predictions must have one non-zero shape")
         if not np.all(np.isfinite(pred_original)) or not np.all(np.isfinite(pred_log)):
             raise ValueError("baseline predictions must contain only finite values")
+        unprojected_original = (
+            pred_original.copy()
+            if self.unprojected_original is None
+            else np.asarray(self.unprojected_original, dtype=np.float64).ravel()
+        )
+        if unprojected_original.shape != pred_original.shape:
+            raise ValueError("unprojected/final original predictions must align")
+        projected, expected_diagnostics = project_nonnegative_predictions(
+            unprojected_original
+        )
+        if not np.array_equal(pred_original, projected):
+            raise ValueError(
+                "pred_original must equal the recorded nonnegative support projection"
+            )
+        diagnostics = self.support_diagnostics or expected_diagnostics
+        if diagnostics != expected_diagnostics:
+            raise ValueError("prediction support diagnostics do not match predictions")
         object.__setattr__(self, "pred_original", pred_original)
         object.__setattr__(self, "pred_log", pred_log)
+        object.__setattr__(self, "unprojected_original", unprojected_original)
+        object.__setattr__(self, "support_diagnostics", diagnostics)
 
 
 @dataclass(frozen=True)
@@ -298,8 +338,13 @@ class ModelContract:
     loss_objective: str
     inverse_mode: Literal["none", "median", "duan_smearing"]
     smearing_factor: float | None
+    prediction_support_policy: str = NONNEGATIVE_PREDICTION_SUPPORT_POLICY
     best_iteration: int | None = None
     best_epoch: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.prediction_support_policy != NONNEGATIVE_PREDICTION_SUPPORT_POLICY:
+            raise ValueError("model contract has an unsupported prediction policy")
 
 
 class FittedBaseline(Protocol):
@@ -322,6 +367,7 @@ class TrainMeanConfig:
             "train_seed": train_seed,
             "target_scale": target_scale,
             "objective": "mean_original_target",
+            "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
         }
 
 
@@ -333,11 +379,11 @@ class FittedTrainMean:
     def predict(self, features: NDArray[np.float64]) -> BaselinePredictions:
         n_samples = _validated_feature_count(features)
         pred_original = np.full(n_samples, self.mean_original, dtype=np.float64)
-        pred_log = target_transform(
+        return _original_prediction_pair(
             pred_original,
-            scale=self.contract.target_scale,
+            target_scale=self.contract.target_scale,
+            model_name=self.contract.model_name,
         )
-        return BaselinePredictions(pred_original, pred_log)
 
 
 def fit_train_mean(
@@ -429,6 +475,7 @@ class LightGBMConfig:
             "early_stopping_rounds": self.early_stopping_rounds,
             "tweedie_variance_power": self.tweedie_variance_power,
             "train_seed": train_seed,
+            "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
         }
 
     def estimator_params(self, *, train_seed: int) -> dict[str, Any]:
@@ -468,14 +515,12 @@ class FittedLightGBM:
             dtype=np.float64,
         ).ravel()
         if self.target_space == "log":
-            pred_log = model_prediction
-            pred_original = inverse_target(
-                pred_log,
+            return _log_prediction_pair(
+                model_prediction,
                 scale=self.contract.target_scale,
                 mode=self.contract.inverse_mode,
                 smearing_factor=self.contract.smearing_factor,
             )
-            return BaselinePredictions(pred_original, pred_log)
         return _original_prediction_pair(
             model_prediction,
             target_scale=self.contract.target_scale,
@@ -595,17 +640,19 @@ def select_log_inverse_on_validation(
     """Select median or Duan using train residuals and validation raw MAE."""
 
     factor = duan_smearing_factor(train_pred_log, train_true_log)
-    median_prediction = inverse_target(
+    median_unprojected = inverse_target(
         validation_pred_log,
         scale=target_scale,
         mode="median",
     )
-    duan_prediction = inverse_target(
+    duan_unprojected = inverse_target(
         validation_pred_log,
         scale=target_scale,
         mode="duan_smearing",
         smearing_factor=factor,
     )
+    median_prediction, _ = project_nonnegative_predictions(median_unprojected)
+    duan_prediction, _ = project_nonnegative_predictions(duan_unprojected)
     median_mae = float(
         regression_metrics(validation_true_original, median_prediction)["mae"]
     )
@@ -628,10 +675,17 @@ def _original_unit_mae_metric(
     ) -> tuple[str, float, bool]:
         if target_space == "log":
             true_original = inverse_target(y_true, scale=target_scale, mode="median")
-            pred_original = inverse_target(y_pred, scale=target_scale, mode="median")
+            unprojected_prediction = inverse_target(
+                y_pred,
+                scale=target_scale,
+                mode="median",
+            )
         else:
             true_original = np.asarray(y_true, dtype=np.float64)
-            pred_original = np.asarray(y_pred, dtype=np.float64)
+            unprojected_prediction = np.asarray(y_pred, dtype=np.float64)
+        pred_original, _ = project_nonnegative_predictions(
+            unprojected_prediction
+        )
         mae = regression_metrics(true_original, pred_original)["mae"]
         return "original_unit_mae", float(mae), False
 
@@ -656,15 +710,46 @@ def _original_prediction_pair(
     target_scale: float,
     model_name: str,
 ) -> BaselinePredictions:
-    pred_original = np.asarray(pred_original, dtype=np.float64).ravel()
-    if np.any(pred_original < 0.0):
-        minimum = float(np.min(pred_original))
-        raise ValueError(
-            f"{model_name} produced a negative raw prediction ({minimum}); "
-            "no silent clipping is allowed before log-space evaluation"
-        )
-    pred_log = target_transform(pred_original, scale=target_scale)
-    return BaselinePredictions(pred_original, pred_log)
+    if not model_name:
+        raise ValueError("model_name must not be empty")
+    unprojected_original = np.asarray(pred_original, dtype=np.float64).ravel()
+    final_original, diagnostics = project_nonnegative_predictions(
+        unprojected_original
+    )
+    pred_log = target_transform(final_original, scale=target_scale)
+    return BaselinePredictions(
+        final_original,
+        pred_log,
+        unprojected_original,
+        diagnostics,
+    )
+
+
+def _log_prediction_pair(
+    pred_log: NDArray[np.float64],
+    *,
+    scale: float,
+    mode: Literal["median", "duan_smearing"],
+    smearing_factor: float | None,
+) -> BaselinePredictions:
+    """Keep native log predictions while projecting their original-unit inverse."""
+
+    native_pred_log = np.asarray(pred_log, dtype=np.float64).ravel()
+    unprojected_original = inverse_target(
+        native_pred_log,
+        scale=scale,
+        mode=mode,
+        smearing_factor=smearing_factor,
+    )
+    final_original, diagnostics = project_nonnegative_predictions(
+        unprojected_original
+    )
+    return BaselinePredictions(
+        final_original,
+        native_pred_log,
+        unprojected_original,
+        diagnostics,
+    )
 
 
 @dataclass(frozen=True)
@@ -711,6 +796,7 @@ def evaluate_fitted_baseline(
         y_pred_original=predictions.pred_original,
         y_true_log=split.target_log,
         y_pred_log=predictions.pred_log,
+        prediction_support=predictions.support_diagnostics,
     )
     return BaselineEvaluation(result, predictions)
 
@@ -815,6 +901,17 @@ def create_frozen_baseline_selection(
             "smearing_factor": result["smearing_factor"],
             "best_iteration": result["best_iteration"],
             "best_epoch": result["best_epoch"],
+            "prediction_support_policy": result[
+                "prediction_support_policy"
+            ],
+            "pre_projection_negative_count": result[
+                "pre_projection_negative_count"
+            ],
+            "pre_projection_negative_fraction": result[
+                "pre_projection_negative_fraction"
+            ],
+            "pre_projection_minimum": result["pre_projection_minimum"],
+            "projection_applied_count": result["projection_applied_count"],
             "validation_metrics": {
                 "headline_metrics": result["headline_metrics"],
                 "secondary_metrics": result["secondary_metrics"],
@@ -909,6 +1006,11 @@ def authorize_test_evaluation(
         "smearing_factor",
         "best_iteration",
         "best_epoch",
+        "prediction_support_policy",
+        "pre_projection_negative_count",
+        "pre_projection_negative_fraction",
+        "pre_projection_minimum",
+        "projection_applied_count",
     )
     for field_name in selected_fields:
         if (

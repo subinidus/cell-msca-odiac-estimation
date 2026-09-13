@@ -5,6 +5,7 @@
     "train",
     "validation"
   ],
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "owner": "engineering-smoke",
   "model_family": "cell_msca",
   "frozen_train_seed": 3407,
@@ -44,14 +45,14 @@
     "split_config_sha256": "eee79ad53fe4ff868668f377d1e66ea9e273ebb3c17838d3f88356e28a3c7ee1",
     "preprocessing_sha256": "9f7225aaf157519c004516a4a48a147a636200e221c092162409dd53294000a3",
     "configuration_sha256_by_variant_and_device": {
-      "token_no_attention:cpu": "3df0272f1b31d4a90d5147c64fc62c93ad923de66a376e1c28e99aae003a6051",
-      "token_no_attention:cuda": "7aae1d551ebfa46a97a23e73ebae898b130360479516bf10db509554a3578814",
-      "forward:cpu": "bfc7a3205aea25d680a2660b9f54ce4ccba57e598035aa72e53262aba964f05f",
-      "forward:cuda": "763afba537acc215f25696e24eb2a653fd41da5aebe6e4f7fe26cbe6086017fa",
-      "reverse:cpu": "396ab0ac3dc03658c355c94701e643421e609a2bf735468920d624e75c557bf0",
-      "reverse:cuda": "3804a2d793e24353b6884f4aab22c2fc5fb787cd8e06973e5b7d064cba75afe9",
-      "bidirectional:cpu": "701a609d36616f4a63b07f970b53420453b8d65cbc72e150bafa42648cdbe8ae",
-      "bidirectional:cuda": "08c12b783d049f8e99222a866c678027a03ca2a4d0e5f0e5dad4c92912bd585f"
+      "token_no_attention:cpu": "f695b3e92abe74c8ecd06b7742746349151739a5d7ce8c2835701fcd20edbf75",
+      "token_no_attention:cuda": "dbac9028d6902c02d15251a0274c0a29682b2a15363f0d1d22d16174a6da130e",
+      "forward:cpu": "be41904771d0e180311f5b369737f363597a5642f009f4faecde2ce890536fb9",
+      "forward:cuda": "db0c8f707fc8bb4c30a75695a5cd4a02e48be4f55bf65ab359939bd998770e53",
+      "reverse:cpu": "b6dd9cb3ce4d901ebd979308b3e0ccad8db127a4400b9d01ca02f87ad216a4a3",
+      "reverse:cuda": "10ceebe4a32ea80501bde4e179c8573c26c7094589be2a6e2113887e2046c71f",
+      "bidirectional:cpu": "f3439546f20d8cfed7083514cc885f1eee522cd1bc1a2bbbd60004e59dcd7559",
+      "bidirectional:cuda": "fd290572387d35ac7cbd93f8245b9d792670166e7f801cbc864175ea01555afb"
     }
   }
 }

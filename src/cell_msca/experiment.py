@@ -27,9 +27,11 @@ from .evaluate import (
     verify_baseline_result_from_prediction_csv,
     write_metrics_json,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from .neural_baselines import ConcatMLPConfig, fit_concat_mlp
 from .splits import CellFixedSplitConfig
+from .target import NONNEGATIVE_PREDICTION_SUPPORT_POLICY
 
 BASELINE_EXPERIMENT_SCHEMA_VERSION = "cell_msca.baseline_experiment.v1"
 BASELINE_SUITE_MODELS = (
@@ -90,6 +92,7 @@ class ValidationArtifactSet:
     candidate_results_json: Path
     selected_results_json: Path
     prediction_csvs: tuple[Path, ...]
+    negative_prediction_csvs: tuple[Path, ...]
     manifest_json: Path
 
 
@@ -109,6 +112,11 @@ def load_baseline_experiment_config(
         raise ValueError(
             "baseline config stage must be validation_tuning; test is gated in code"
         )
+    if (
+        values.get("prediction_support_policy")
+        != NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+    ):
+        raise ValueError("baseline prediction support policy is missing or changed")
     project_root = (config_path.parent / values.get("project_root", "..")).resolve()
     split_values = values.get("split")
     if not isinstance(split_values, dict):
@@ -171,6 +179,7 @@ def save_validation_tuning_artifacts(
     selected_results_path = output_dir / "selected_results.json"
     manifest_path = output_dir / "validation_run_manifest.json"
     prediction_paths: list[Path] = []
+    diagnostic_paths: list[Path] = []
     candidate_entries: list[dict[str, Any]] = []
     for model_name in BASELINE_SUITE_MODELS:
         selection = result.selections[model_name]
@@ -185,11 +194,19 @@ def save_validation_tuning_artifacts(
                     "validation_predictions.csv"
                 )
             )
+            diagnostic_paths.append(
+                output_dir
+                / (
+                    f"{model_name}.candidate_{candidate_index:03d}."
+                    "validation_negative_predictions.csv"
+                )
+            )
             candidate_entries.append(
                 {
                     "candidate_id": f"{model_name}.candidate_{candidate_index:03d}",
                     "selected": candidate_index - 1 == selection.selected_index,
                     "prediction_csv": prediction_paths[-1].name,
+                    "negative_prediction_csv": diagnostic_paths[-1].name,
                     "result": evaluation.result,
                 }
             )
@@ -199,6 +216,7 @@ def save_validation_tuning_artifacts(
         selected_results_path,
         manifest_path,
         *prediction_paths,
+        *diagnostic_paths,
     ]
     existing = [str(path) for path in all_paths if path.exists()]
     if existing:
@@ -220,6 +238,16 @@ def save_validation_tuning_artifacts(
                 y_true_log=validation_split.target_log,
                 y_pred_log=evaluation.predictions.pred_log,
                 cell_ids=validation_split.cell_ids,
+            )
+            write_prediction_support_diagnostic_csv(
+                diagnostic_paths[entry_index],
+                y_true_original=validation_split.target_original,
+                unprojected_prediction=(
+                    evaluation.predictions.unprojected_original
+                ),
+                final_prediction=evaluation.predictions.pred_original,
+                cell_ids=validation_split.cell_ids,
+                month_ids=validation_split.month_ids,
             )
             verify_baseline_result_from_prediction_csv(
                 prediction_path,
@@ -247,6 +275,28 @@ def save_validation_tuning_artifacts(
         "schema_version": "cell_msca.validation_run_manifest.v1",
         "stage": "validation_tuning",
         "test_subset_materialized": False,
+        "test_evaluation_performed": False,
+        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+        "prediction_support_diagnostics": {
+            entry["candidate_id"]: {
+                "prediction_support_policy": entry["result"][
+                    "prediction_support_policy"
+                ],
+                "pre_projection_negative_count": entry["result"][
+                    "pre_projection_negative_count"
+                ],
+                "pre_projection_negative_fraction": entry["result"][
+                    "pre_projection_negative_fraction"
+                ],
+                "pre_projection_minimum": entry["result"][
+                    "pre_projection_minimum"
+                ],
+                "projection_applied_count": entry["result"][
+                    "projection_applied_count"
+                ],
+            }
+            for entry in candidate_entries
+        },
         "experiment_config_sha256": experiment_config_sha256,
         "data_sha256": first_row["data_sha256"],
         "split_sha256": first_row["split_sha256"],
@@ -257,6 +307,9 @@ def save_validation_tuning_artifacts(
         "candidate_results_json": candidate_results_path.name,
         "selected_results_json": selected_results_path.name,
         "prediction_csvs": [path.name for path in prediction_paths],
+        "negative_prediction_csvs": [
+            path.name for path in diagnostic_paths
+        ],
         "prediction_metric_verification": "passed_for_all_including_spearman",
     }
     write_metrics_json(candidate_results_path, candidate_payload)
@@ -267,6 +320,7 @@ def save_validation_tuning_artifacts(
         candidate_results_json=candidate_results_path,
         selected_results_json=selected_results_path,
         prediction_csvs=tuple(prediction_paths),
+        negative_prediction_csvs=tuple(diagnostic_paths),
         manifest_json=manifest_path,
     )
 

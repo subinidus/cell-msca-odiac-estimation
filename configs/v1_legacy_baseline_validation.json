@@ -5,6 +5,7 @@
     "train",
     "validation"
   ],
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
   "execution_policy": {
     "default_action": "integrity_only",

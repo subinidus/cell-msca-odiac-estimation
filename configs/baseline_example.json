@@ -1,6 +1,7 @@
 {
   "schema_version": "cell_msca.baseline_experiment.v1",
   "stage": "validation_tuning",
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "project_root": "..",
   "data": {
     "npz_glob": "data/v1_legacy/*.npz",
