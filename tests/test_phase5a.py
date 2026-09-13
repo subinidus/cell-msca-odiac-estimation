@@ -6,9 +6,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import stat
 import tempfile
 import unittest
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,7 +43,9 @@ from cell_msca.phase5a import (
     _seed_metric_summary,
     _save_and_verify_lightgbm_model,
     _validate_phase5a_output_path,
+    SEED42_REQUIRED_ARTIFACT_KEYS,
     aggregate_phase5a_results,
+    discover_validation_artifacts,
     freeze_lightgbm_convergence_selection,
     load_lightgbm_selection,
     load_phase5a_assignments,
@@ -183,6 +188,23 @@ class Phase5AContractTests(unittest.TestCase):
         cls.config_path = cls.root / "configs" / "phase5a_validation_robustness.json"
         cls.assignments_path = cls.root / "configs" / "phase5a_experiment_assignments.json"
         cls.values = load_phase5a_config(cls.config_path)
+
+    def _write_required_discovery_fixture(self, root: Path) -> None:
+        hashes = dict(self.values["required_hashes"])
+        for index, (model_name, train_seed) in enumerate(
+            sorted(SEED42_REQUIRED_ARTIFACT_KEYS),
+            start=1,
+        ):
+            _write_validation_artifact(
+                root / f"required-{index}",
+                model_name=model_name,
+                train_seed=train_seed,
+                config_sha256=str(index) * 64,
+                git_sha="a" * 40,
+                hashes=hashes,
+                prediction_offset=index / 100.0,
+                legacy_schema=True,
+            )
 
     def test_frozen_config_and_assignments_reject_scope_expansion(self) -> None:
         values = self.values
@@ -392,6 +414,159 @@ class Phase5AContractTests(unittest.TestCase):
                 artifact.manifest["pre_projection_negative_count"],
                 0,
             )
+
+    def test_filtered_discovery_skips_nonrequired_name_mismatch_but_strict_rejects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_required_discovery_fixture(root)
+            concat = _write_validation_artifact(
+                root / "concat-mismatch",
+                model_name="concat_mlp_log1p",
+                train_seed=42,
+                config_sha256="9" * 64,
+                git_sha="a" * 40,
+                hashes=dict(self.values["required_hashes"]),
+                prediction_offset=0.1,
+                legacy_schema=True,
+            )
+            metrics_path = concat / "validation_metrics.json"
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            metrics["result"]["model_name"] = "concat_mlp"
+            write_metrics_json(metrics_path, metrics, overwrite=True)
+
+            audit: dict[str, object] = {}
+            artifacts = discover_validation_artifacts(
+                root,
+                required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                audit=audit,
+            )
+
+            self.assertEqual(set(artifacts), SEED42_REQUIRED_ARTIFACT_KEYS)
+            excluded = audit["excluded_artifacts"]
+            self.assertEqual(len(excluded), 1)
+            self.assertEqual(excluded[0]["model_name"], "concat_mlp")
+            self.assertEqual(excluded[0]["directory"], str(concat.resolve()))
+            with self.assertRaisesRegex(ValueError, "model_name mismatch"):
+                discover_validation_artifacts(root)
+
+    def test_filtered_discovery_still_rejects_required_name_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_required_discovery_fixture(root)
+            required = next(
+                path
+                for path in root.iterdir()
+                if json.loads(
+                    (path / "validation_metrics.json").read_text(encoding="utf-8")
+                )["result"]["model_name"]
+                == "lightgbm_raw"
+            )
+            manifest_path = required / "run_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["model_name"] = "changed_required_model"
+            write_metrics_json(manifest_path, manifest, overwrite=True)
+
+            with self.assertRaisesRegex(ValueError, "model_name mismatch"):
+                discover_validation_artifacts(
+                    root,
+                    required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                )
+
+    def test_filtered_discovery_rejects_missing_required_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_required_discovery_fixture(root)
+            missing = next(
+                path
+                for path in root.iterdir()
+                if json.loads(
+                    (path / "validation_metrics.json").read_text(encoding="utf-8")
+                )["result"]["model_name"]
+                == "lightgbm_log1p"
+            )
+            for path in missing.iterdir():
+                path.unlink()
+            missing.rmdir()
+
+            with self.assertRaisesRegex(ValueError, "required validation artifacts are missing"):
+                discover_validation_artifacts(
+                    root,
+                    required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                )
+
+    def test_filtered_discovery_rejects_duplicate_required_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_required_discovery_fixture(root)
+            _write_validation_artifact(
+                root / "duplicate-raw",
+                model_name="lightgbm_raw",
+                train_seed=42,
+                config_sha256="8" * 64,
+                git_sha="a" * 40,
+                hashes=dict(self.values["required_hashes"]),
+                prediction_offset=0.2,
+                legacy_schema=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate validation artifact"):
+                discover_validation_artifacts(
+                    root,
+                    required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                )
+
+    def test_filtered_discovery_keeps_required_test_gate_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_required_discovery_fixture(root)
+            required = next(root.iterdir())
+            manifest_path = required / "run_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["test_subset_materialized"] = True
+            write_metrics_json(manifest_path, manifest, overwrite=True)
+
+            with self.assertRaisesRegex(ValueError, "closed test gate"):
+                discover_validation_artifacts(
+                    root,
+                    required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                )
+
+    @unittest.skipUnless(
+        os.environ.get("CELL_MSCA_SEED42_PACKAGE_ZIP"),
+        "immutable seed-42 package path is required for the real discovery smoke",
+    )
+    def test_actual_seed42_zip_filtered_discovery_smoke(self) -> None:
+        source = Path(os.environ["CELL_MSCA_SEED42_PACKAGE_ZIP"]).resolve()
+        self.assertEqual(
+            file_sha256(source),
+            "f40aa8db3cff1a56933a69abe9397f43e8df9daa642319848c928cea4ed98555",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            extraction = Path(directory)
+            with zipfile.ZipFile(source, "r") as archive:
+                for member in archive.infolist():
+                    relative = PurePosixPath(member.filename.replace("\\", "/"))
+                    self.assertFalse(relative.is_absolute())
+                    self.assertNotIn("..", relative.parts)
+                    self.assertFalse(stat.S_ISLNK(member.external_attr >> 16))
+                archive.extractall(extraction)
+            audit: dict[str, object] = {}
+            artifacts = discover_validation_artifacts(
+                extraction,
+                required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+                audit=audit,
+            )
+            self.assertEqual(set(artifacts), SEED42_REQUIRED_ARTIFACT_KEYS)
+            self.assertEqual(len(audit["excluded_artifacts"]), 5)
+            self.assertIn(
+                "concat_mlp",
+                {row["model_name"] for row in audit["excluded_artifacts"]},
+            )
+            for artifact in artifacts.values():
+                self.assertFalse(artifact.manifest["test_subset_materialized"])
+                self.assertTrue(artifact.manifest["projection_identity_verified"])
 
     def test_lightgbm_atomic_model_save_cleans_temporary_file_on_failure(self) -> None:
         class FailingBooster:
@@ -799,6 +974,27 @@ class Phase5AContractTests(unittest.TestCase):
                     rows_per_cell=36,
                     legacy_schema=True,
                 )
+            excluded_concat = _write_validation_artifact(
+                seed42_root / "concat-mismatch",
+                model_name="concat_mlp_log1p",
+                train_seed=42,
+                config_sha256="9" * 64,
+                git_sha=seed42_git,
+                hashes=hashes,
+                prediction_offset=0.5,
+                rows_per_cell=36,
+                legacy_schema=True,
+            )
+            excluded_metrics_path = excluded_concat / "validation_metrics.json"
+            excluded_metrics = json.loads(
+                excluded_metrics_path.read_text(encoding="utf-8")
+            )
+            excluded_metrics["result"]["model_name"] = "concat_mlp"
+            write_metrics_json(
+                excluded_metrics_path,
+                excluded_metrics,
+                overwrite=True,
+            )
 
             convergence_paths = {}
             for model_name, offset in (
@@ -889,6 +1085,19 @@ class Phase5AContractTests(unittest.TestCase):
                 )
             )
             self.assertTrue(manifest["prediction_metrics_recalculated"])
+            self.assertTrue(
+                manifest["seed42_artifact_discovery"]["required_filter_applied"]
+            )
+            self.assertEqual(
+                len(manifest["seed42_artifact_discovery"]["loaded_keys"]),
+                4,
+            )
+            self.assertEqual(
+                manifest["seed42_artifact_discovery"]["excluded_artifacts"][0][
+                    "model_name"
+                ],
+                "concat_mlp",
+            )
             self.assertFalse(manifest["test_subset_materialized"])
             for comparison in bootstrap["comparisons"].values():
                 self.assertTrue(comparison["complete_cell_resampling"])
