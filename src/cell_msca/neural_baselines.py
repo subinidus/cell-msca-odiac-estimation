@@ -17,12 +17,17 @@ from .baselines import (
     LogInverseSelection,
     ModelContract,
     TuningData,
+    _log_prediction_pair,
     _validated_feature_count,
     select_log_inverse_on_validation,
 )
 from .data import STREAM_A_FEATURES, STREAM_B_FEATURES, canonical_sha256
 from .metrics import regression_metrics
-from .target import inverse_target
+from .target import (
+    NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+    inverse_target,
+    project_nonnegative_predictions,
+)
 
 NeuralLoss = Literal["log_l1", "log_huber"]
 NeuralModelFactory = Callable[[Any, int, Any], Any]
@@ -98,6 +103,7 @@ class ConcatMLPConfig:
             "device": self.device,
             "deterministic_algorithms": True,
             "checkpoint_metric": "median_inverse_validation_original_unit_mae",
+            "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
             "train_seed": train_seed,
             "target_transform": "log1p",
             "target_scale": target_scale,
@@ -125,13 +131,12 @@ class FittedConcatMLP:
             self.model,
             np.asarray(features, dtype=np.float64),
         )
-        pred_original = inverse_target(
+        return _log_prediction_pair(
             pred_log,
             scale=self.contract.target_scale,
             mode=self.contract.inverse_mode,
             smearing_factor=self.contract.smearing_factor,
         )
-        return BaselinePredictions(pred_original, pred_log)
 
 
 def fit_concat_mlp(
@@ -430,11 +435,12 @@ def _median_inverse_validation_mae(
     validation_pred_log: NDArray[np.float64],
     target_scale: float,
 ) -> float:
-    pred_original = inverse_target(
+    unprojected_original = inverse_target(
         validation_pred_log,
         scale=target_scale,
         mode="median",
     )
+    pred_original, _ = project_nonnegative_predictions(unprojected_original)
     return float(
         regression_metrics(validation_true_original, pred_original)["mae"]
     )

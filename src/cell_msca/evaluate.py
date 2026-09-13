@@ -6,6 +6,7 @@ import csv
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,11 @@ from .metrics import (
     metrics_by_space,
     spearman_correlation,
 )
+from .target import (
+    NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+    PredictionSupportDiagnostics,
+    project_nonnegative_predictions,
+)
 
 PREDICTION_COLUMNS = (
     "cell_id",
@@ -26,9 +32,17 @@ PREDICTION_COLUMNS = (
     "true_log",
     "pred_log",
 )
+PREDICTION_SUPPORT_DIAGNOSTIC_COLUMNS = (
+    "cell_id",
+    "month_id",
+    "true_original",
+    "unprojected_prediction",
+    "final_prediction",
+)
 
-BASELINE_RESULT_SCHEMA_VERSION = "cell_msca.baseline_result.v1"
-BASELINE_RESULT_FIELDS = {
+LEGACY_BASELINE_RESULT_SCHEMA_VERSION = "cell_msca.baseline_result.v1"
+BASELINE_RESULT_SCHEMA_VERSION = "cell_msca.baseline_result.v2"
+LEGACY_BASELINE_RESULT_FIELDS = {
     "schema_version",
     "model_name",
     "data_version",
@@ -49,6 +63,13 @@ BASELINE_RESULT_FIELDS = {
     "secondary_metrics",
     "best_iteration",
     "best_epoch",
+}
+BASELINE_RESULT_FIELDS = LEGACY_BASELINE_RESULT_FIELDS | {
+    "prediction_support_policy",
+    "pre_projection_negative_count",
+    "pre_projection_negative_fraction",
+    "pre_projection_minimum",
+    "projection_applied_count",
 }
 _FORBIDDEN_RESULT_KEY_FRAGMENTS = (
     "hotspot",
@@ -187,6 +208,60 @@ def write_prediction_csv(
                     "pred_original": repr(float(arrays["pred_original"][index])),
                     "true_log": repr(float(arrays["true_log"][index])),
                     "pred_log": repr(float(arrays["pred_log"][index])),
+                }
+            )
+    return output_path
+
+
+def write_prediction_support_diagnostic_csv(
+    path: str | Path,
+    *,
+    y_true_original: ArrayLike,
+    unprojected_prediction: ArrayLike,
+    final_prediction: ArrayLike,
+    cell_ids: ArrayLike,
+    month_ids: ArrayLike | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Write only rows changed by the explicit nonnegative support policy."""
+
+    true_values = _finite_1d(y_true_original, name="y_true_original")
+    unprojected = _finite_1d(
+        unprojected_prediction,
+        name="unprojected_prediction",
+    )
+    final = _finite_1d(final_prediction, name="final_prediction")
+    if true_values.shape != unprojected.shape or final.shape != unprojected.shape:
+        raise ValueError("support diagnostic arrays must have the same shape")
+    projected, _ = project_nonnegative_predictions(unprojected)
+    if not np.array_equal(final, projected):
+        raise ValueError("final_prediction does not match the support projection")
+    cells = np.asarray(cell_ids, dtype=str).ravel()
+    if cells.shape != unprojected.shape:
+        raise ValueError("cell_ids do not align with support diagnostic rows")
+    if month_ids is None:
+        months = np.full(unprojected.size, "", dtype=str)
+    else:
+        months = np.asarray(month_ids, dtype=str).ravel()
+        if months.shape != unprojected.shape:
+            raise ValueError("month_ids do not align with support diagnostic rows")
+
+    output_path = _new_output_path(path, overwrite=overwrite)
+    changed_indices = np.flatnonzero(unprojected < 0.0)
+    with output_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=PREDICTION_SUPPORT_DIAGNOSTIC_COLUMNS,
+        )
+        writer.writeheader()
+        for index in changed_indices:
+            writer.writerow(
+                {
+                    "cell_id": str(cells[index]),
+                    "month_id": str(months[index]),
+                    "true_original": repr(float(true_values[index])),
+                    "unprojected_prediction": repr(float(unprojected[index])),
+                    "final_prediction": repr(float(final[index])),
                 }
             )
     return output_path
@@ -354,8 +429,23 @@ def evaluate_baseline_predictions(
     y_pred_original: ArrayLike,
     y_true_log: ArrayLike,
     y_pred_log: ArrayLike,
+    prediction_support: PredictionSupportDiagnostics | None = None,
 ) -> dict[str, Any]:
     """Build one paper-facing baseline row through the shared evaluator."""
+
+    final_prediction = _finite_1d(y_pred_original, name="y_pred_original")
+    if np.any(final_prediction < 0.0):
+        raise ValueError("paper-facing pred_original must be nonnegative")
+    if prediction_support is None:
+        _, prediction_support = project_nonnegative_predictions(final_prediction)
+    if prediction_support.sample_count != final_prediction.size:
+        raise ValueError("prediction support diagnostics sample count mismatch")
+    final_minimum = float(np.min(final_prediction))
+    if prediction_support.pre_projection_negative_count == 0:
+        if prediction_support.pre_projection_minimum != final_minimum:
+            raise ValueError("identity support diagnostics do not match prediction")
+    elif final_minimum != 0.0:
+        raise ValueError("projected prediction must contain zero for negative inputs")
 
     metrics = metrics_by_space(
         y_true_original=y_true_original,
@@ -392,6 +482,17 @@ def evaluate_baseline_predictions(
         },
         "best_iteration": context.best_iteration,
         "best_epoch": context.best_epoch,
+        "prediction_support_policy": (
+            prediction_support.prediction_support_policy
+        ),
+        "pre_projection_negative_count": (
+            prediction_support.pre_projection_negative_count
+        ),
+        "pre_projection_negative_fraction": (
+            prediction_support.pre_projection_negative_fraction
+        ),
+        "pre_projection_minimum": prediction_support.pre_projection_minimum,
+        "projection_applied_count": prediction_support.projection_applied_count,
     }
     validate_baseline_result_row(result)
     return result
@@ -412,16 +513,21 @@ def _walk_mapping_keys(value: Any) -> list[str]:
 def validate_baseline_result_row(result: Mapping[str, Any]) -> None:
     """Validate the exact Phase 3 baseline result schema and exclusions."""
 
+    schema_version = result.get("schema_version")
+    if schema_version == BASELINE_RESULT_SCHEMA_VERSION:
+        expected_fields = BASELINE_RESULT_FIELDS
+    elif schema_version == LEGACY_BASELINE_RESULT_SCHEMA_VERSION:
+        expected_fields = LEGACY_BASELINE_RESULT_FIELDS
+    else:
+        raise ValueError("unsupported baseline result schema_version")
     actual_fields = set(result)
-    if actual_fields != BASELINE_RESULT_FIELDS:
-        missing = sorted(BASELINE_RESULT_FIELDS - actual_fields)
-        unexpected = sorted(actual_fields - BASELINE_RESULT_FIELDS)
+    if actual_fields != expected_fields:
+        missing = sorted(expected_fields - actual_fields)
+        unexpected = sorted(actual_fields - expected_fields)
         raise ValueError(
             "baseline result fields do not match the schema: "
             f"missing={missing}, unexpected={unexpected}"
         )
-    if result["schema_version"] != BASELINE_RESULT_SCHEMA_VERSION:
-        raise ValueError("unsupported baseline result schema_version")
     BaselineResultContext(
         model_name=str(result["model_name"]),
         data_version=str(result["data_version"]),
@@ -492,6 +598,35 @@ def validate_baseline_result_row(result: Mapping[str, Any]) -> None:
             raise ValueError(f"{namespace} must contain finite values")
     if not np.isfinite(float(secondary["spearman"])):
         raise ValueError("secondary Spearman must be finite")
+    if schema_version == BASELINE_RESULT_SCHEMA_VERSION:
+        negative_count = result["pre_projection_negative_count"]
+        applied_count = result["projection_applied_count"]
+        if isinstance(negative_count, (bool, np.bool_)) or not isinstance(
+            negative_count,
+            (int, np.integer),
+        ):
+            raise ValueError("pre_projection_negative_count must be an integer")
+        if isinstance(applied_count, (bool, np.bool_)) or not isinstance(
+            applied_count,
+            (int, np.integer),
+        ):
+            raise ValueError("projection_applied_count must be an integer")
+        negative_fraction = result["pre_projection_negative_fraction"]
+        pre_projection_minimum = result["pre_projection_minimum"]
+        for field_name, value in (
+            ("pre_projection_negative_fraction", negative_fraction),
+            ("pre_projection_minimum", pre_projection_minimum),
+        ):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                raise ValueError(f"{field_name} must be a finite number")
+        PredictionSupportDiagnostics(
+            prediction_support_policy=str(result["prediction_support_policy"]),
+            sample_count=int(headline["original_unit"]["n"]),
+            pre_projection_negative_count=int(negative_count),
+            pre_projection_negative_fraction=float(negative_fraction),
+            pre_projection_minimum=float(pre_projection_minimum),
+            projection_applied_count=int(applied_count),
+        )
 
 
 def write_baseline_result_json(
@@ -517,6 +652,12 @@ def verify_baseline_result_from_prediction_csv(
 
     validate_baseline_result_row(result)
     values = read_prediction_csv(prediction_csv)
+    if result["schema_version"] == BASELINE_RESULT_SCHEMA_VERSION and np.any(
+        values["pred_original"] < 0.0
+    ):
+        raise MetricMismatchError(
+            "new-schema prediction CSV violates the nonnegative support policy"
+        )
     recalculated = metrics_by_space(
         y_true_original=values["true_original"],
         y_pred_original=values["pred_original"],
@@ -577,4 +718,29 @@ def verify_baseline_result_from_prediction_csv(
             "log_space": recalculated["log_space"],
             "spearman": recalculated_spearman,
         },
+    }
+
+
+def verify_legacy_projection_identity_from_prediction_csv(
+    prediction_csv: str | Path,
+) -> dict[str, bool | int | float | str]:
+    """Verify that a legacy prediction already satisfies the new support policy."""
+
+    values = read_prediction_csv(prediction_csv)
+    prediction = values["pred_original"]
+    projected, diagnostics = project_nonnegative_predictions(prediction)
+    if not np.array_equal(prediction, projected):
+        raise ValueError(
+            "legacy prediction artifact is not identity-compatible with the "
+            "nonnegative support policy"
+        )
+    return {
+        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+        "projection_identity_verified": True,
+        "pre_projection_negative_count": diagnostics.pre_projection_negative_count,
+        "pre_projection_negative_fraction": (
+            diagnostics.pre_projection_negative_fraction
+        ),
+        "pre_projection_minimum": diagnostics.pre_projection_minimum,
+        "projection_applied_count": diagnostics.projection_applied_count,
     }

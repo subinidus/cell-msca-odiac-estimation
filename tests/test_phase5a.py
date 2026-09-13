@@ -14,9 +14,16 @@ from unittest import mock
 
 import numpy as np
 
-from cell_msca.baselines import LightGBMConfig
+from cell_msca.baselines import (
+    FittedLightGBM,
+    LightGBMConfig,
+    ModelContract,
+    _original_prediction_pair,
+)
 from cell_msca.data import canonical_npz_content_sha256, canonical_sha256, file_sha256
 from cell_msca.evaluate import (
+    LEGACY_BASELINE_RESULT_FIELDS,
+    LEGACY_BASELINE_RESULT_SCHEMA_VERSION,
     BaselineResultContext,
     evaluate_baseline_predictions,
     write_metrics_json,
@@ -31,6 +38,7 @@ from cell_msca.phase5a import (
     _lightgbm_config,
     _lightgbm_iteration_summary,
     _seed_metric_summary,
+    _save_and_verify_lightgbm_model,
     _validate_phase5a_output_path,
     aggregate_phase5a_results,
     freeze_lightgbm_convergence_selection,
@@ -59,6 +67,7 @@ def _write_validation_artifact(
     prediction_offset: float,
     run_type: str = "repeat",
     rows_per_cell: int = 1,
+    legacy_schema: bool = False,
 ) -> Path:
     directory.mkdir(parents=True)
     true_original = np.repeat(
@@ -93,6 +102,11 @@ def _write_validation_artifact(
         y_true_log=true_log,
         y_pred_log=pred_log,
     )
+    stored_result = dict(result)
+    if legacy_schema:
+        stored_result["schema_version"] = LEGACY_BASELINE_RESULT_SCHEMA_VERSION
+        for field in set(stored_result) - LEGACY_BASELINE_RESULT_FIELDS:
+            del stored_result[field]
     write_prediction_csv(
         directory / "validation_predictions.csv",
         y_true_original=true_original,
@@ -113,7 +127,7 @@ def _write_validation_artifact(
                 if model_name.startswith("lightgbm")
                 else {}
             ),
-            "result": result,
+            "result": stored_result,
         },
     )
     write_metrics_json(
@@ -126,6 +140,27 @@ def _write_validation_artifact(
             "split_seed": 42,
             **hashes,
             "configuration_sha256": config_sha256,
+            **(
+                {}
+                if legacy_schema
+                else {
+                    "prediction_support_policy": result[
+                        "prediction_support_policy"
+                    ],
+                    "pre_projection_negative_count": result[
+                        "pre_projection_negative_count"
+                    ],
+                    "pre_projection_negative_fraction": result[
+                        "pre_projection_negative_fraction"
+                    ],
+                    "pre_projection_minimum": result[
+                        "pre_projection_minimum"
+                    ],
+                    "projection_applied_count": result[
+                        "projection_applied_count"
+                    ],
+                }
+            ),
             "git_commit_sha": git_sha,
             "allowed_materialized_splits": ["train", "validation"],
             "test_subset_materialized": False,
@@ -152,6 +187,10 @@ class Phase5AContractTests(unittest.TestCase):
     def test_frozen_config_and_assignments_reject_scope_expansion(self) -> None:
         values = self.values
         self.assertEqual(values["seeds"]["new_training"], [43, 44])
+        self.assertEqual(
+            values["prediction_support_policy"],
+            "nonnegative_max_zero_v1",
+        )
         self.assertEqual(values["lightgbm_convergence"]["parameters"]["n_estimators"], 5000)
         self.assertEqual(
             values["lightgbm_convergence"]["parameters"]["early_stopping_rounds"],
@@ -315,6 +354,125 @@ class Phase5AContractTests(unittest.TestCase):
             changed = load_stored_validation_artifact(second.directory)
             with self.assertRaisesRegex(ValueError, "cell_id alignment"):
                 _aligned_prediction_arrays([first, changed])
+
+    def test_legacy_seed42_prediction_is_verified_as_projection_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_validation_artifact(
+                Path(directory) / "legacy",
+                model_name="cell_msca_bidirectional",
+                train_seed=42,
+                config_sha256="1" * 64,
+                git_sha="a" * 40,
+                hashes=dict(self.values["required_hashes"]),
+                prediction_offset=0.1,
+            )
+            metrics_path = path / "validation_metrics.json"
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            result = metrics["result"]
+            result["schema_version"] = LEGACY_BASELINE_RESULT_SCHEMA_VERSION
+            for field in set(result) - LEGACY_BASELINE_RESULT_FIELDS:
+                del result[field]
+            write_metrics_json(metrics_path, metrics, overwrite=True)
+            manifest_path = path / "run_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for field in (
+                "prediction_support_policy",
+                "pre_projection_negative_count",
+                "pre_projection_negative_fraction",
+                "pre_projection_minimum",
+                "projection_applied_count",
+            ):
+                del manifest[field]
+            write_metrics_json(manifest_path, manifest, overwrite=True)
+
+            artifact = load_stored_validation_artifact(path)
+
+            self.assertTrue(artifact.manifest["projection_identity_verified"])
+            self.assertEqual(
+                artifact.manifest["pre_projection_negative_count"],
+                0,
+            )
+
+    def test_lightgbm_atomic_model_save_cleans_temporary_file_on_failure(self) -> None:
+        class FailingBooster:
+            @staticmethod
+            def save_model(path: str, *, num_iteration: int) -> None:
+                del path, num_iteration
+                raise RuntimeError("synthetic serialization failure")
+
+        fitted = SimpleNamespace(
+            estimator=SimpleNamespace(booster_=FailingBooster()),
+            contract=SimpleNamespace(best_iteration=3),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "model.txt"
+            with self.assertRaisesRegex(RuntimeError, "serialization failure"):
+                _save_and_verify_lightgbm_model(
+                    destination,
+                    fitted=fitted,
+                    validation_features=np.zeros((2, 7)),
+                    expected_final_prediction=np.ones(2),
+                )
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("lightgbm") is not None,
+        "LightGBM is required for model artifact round-trip",
+    )
+    def test_actual_lightgbm_model_save_reload_prediction_round_trip(self) -> None:
+        import lightgbm as lgb
+
+        rng = np.random.default_rng(42)
+        features = rng.normal(size=(48, 7))
+        target = np.maximum(0.0, 2.0 + features[:, 0] - features[:, 1])
+        estimator = lgb.LGBMRegressor(
+            objective="regression_l1",
+            n_estimators=12,
+            learning_rate=0.1,
+            verbosity=-1,
+            random_state=42,
+        )
+        estimator.fit(features, target)
+        best_iteration = int(estimator.n_estimators_)
+        contract = ModelContract(
+            model_name="lightgbm_raw",
+            config_sha256="1" * 64,
+            target_transform="identity",
+            target_scale=1.0,
+            loss_objective="regression_l1",
+            inverse_mode="none",
+            smearing_factor=None,
+            best_iteration=best_iteration,
+        )
+        fitted = FittedLightGBM(
+            estimator=estimator,
+            target_space="original",
+            contract=contract,
+        )
+        expected = _original_prediction_pair(
+            estimator.predict(features),
+            target_scale=1.0,
+            model_name="lightgbm_raw",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "fitted_model.txt"
+            summary = _save_and_verify_lightgbm_model(
+                destination,
+                fitted=fitted,
+                validation_features=features,
+                expected_final_prediction=expected.pred_original,
+            )
+            self.assertTrue(destination.is_file())
+            self.assertTrue(summary["model_reload_validation_prediction_match"])
+            self.assertRegex(summary["model_sha256"], r"^[0-9a-f]{64}$")
+            with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+                _save_and_verify_lightgbm_model(
+                    destination,
+                    fitted=fitted,
+                    validation_features=features,
+                    expected_final_prediction=expected.pred_original,
+                )
 
     def test_three_seed_summary_uses_sample_standard_deviation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -528,6 +686,7 @@ class Phase5AContractTests(unittest.TestCase):
                 y_pred_log=target_log,
             )
             validation = SimpleNamespace(
+                features=np.zeros((3, 7), dtype=np.float64),
                 target_original=target,
                 target_log=target_log,
                 cell_ids=np.asarray(["cell-a", "cell-b", "cell-c"]),
@@ -555,6 +714,7 @@ class Phase5AContractTests(unittest.TestCase):
                 predictions=SimpleNamespace(
                     pred_original=target,
                     pred_log=target_log,
+                    unprojected_original=target,
                 ),
             )
             git_sha = "a" * 40
@@ -572,6 +732,16 @@ class Phase5AContractTests(unittest.TestCase):
                 mock.patch(
                     "cell_msca.phase5a.evaluate_fitted_baseline",
                     return_value=evaluation,
+                ),
+                mock.patch(
+                    "cell_msca.phase5a._save_and_verify_lightgbm_model",
+                    return_value={
+                        "model_artifact": "fitted_model.txt",
+                        "model_sha256": "f" * 64,
+                        "model_reload_validation_prediction_match": True,
+                        "model_reload_maximum_absolute_prediction_difference": 0.0,
+                        "model_saved_best_iteration": 4800,
+                    },
                 ),
             ):
                 output = run_phase5a_lightgbm(
@@ -596,6 +766,12 @@ class Phase5AContractTests(unittest.TestCase):
             self.assertEqual(manifest["best_iteration"], 4800)
             self.assertEqual(manifest["actual_iterations"], 5000)
             self.assertTrue(manifest["maximum_iteration_reached"])
+            self.assertEqual(
+                manifest["prediction_support_policy"],
+                "nonnegative_max_zero_v1",
+            )
+            self.assertEqual(manifest["pre_projection_negative_count"], 0)
+            self.assertTrue(manifest["model_reload_validation_prediction_match"])
             self.assertFalse(manifest["test_subset_materialized"])
             self.assertFalse(manifest["test_evaluation_performed"])
             protocol.test_data.assert_not_called()
@@ -621,6 +797,7 @@ class Phase5AContractTests(unittest.TestCase):
                     hashes=hashes,
                     prediction_offset=float(offset),
                     rows_per_cell=36,
+                    legacy_schema=True,
                 )
 
             convergence_paths = {}

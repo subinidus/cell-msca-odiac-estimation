@@ -5,6 +5,7 @@
     "train",
     "validation"
   ],
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "owner": "assign-gpu-owner",
   "model_family": "cell_msca",
   "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
@@ -58,14 +59,14 @@
     "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
     "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
     "configuration_sha256_by_variant_and_device": {
-      "token_no_attention:cpu": "028b0ffd725b6b47060223deea16e3059ef86cf33077462129edc447399fa724",
-      "token_no_attention:cuda": "88f9755899a2ecb287c4d69e2f8cd422eb0664616f10eec489cac0e34c5c6349",
-      "forward:cpu": "f3aa644ed17c2dbddb6c25a5d1234a20f014ef3c0f616fc4569b062fe5f75384",
-      "forward:cuda": "305b7e455ac5185acdfc0e62e6dbdfc3145de1bebe17bc1027c7ca83e089d98f",
-      "reverse:cpu": "c43e28fcfa28dbb024984ef8277442d34aa8e9db682c3a15bb268029a51220d7",
-      "reverse:cuda": "5ea22ee78cbce7003ff356b4e84ed6167cf2ef1c4768909cf9f0e7d3e073ffcd",
-      "bidirectional:cpu": "90ad53a037fbd093a78b6e0435c3a2cec9745e008ee7bd1c4809447a09081112",
-      "bidirectional:cuda": "de6c2727759ea8a395e422fca519127e06a27fb68a6bf97d591f15b475a39c48"
+      "token_no_attention:cpu": "9b93b0f86e1890d11b466b7f7ff3c6389eeb85ecf9efb19a9da20be6b0e854b2",
+      "token_no_attention:cuda": "c8d1187fa83c982f50747d50c97990d8970445d1afeca688e79a3e4c8499f051",
+      "forward:cpu": "04c16797fbe5ef84acdfb659e17cab6b58457cf4a82419ef60a3ec0c00847b37",
+      "forward:cuda": "f7989ffb69613471330ec04634c6cafeb0c7a67bedf558b509e1e502821d2832",
+      "reverse:cpu": "094b8115db341c7291192f48605692648d5b2e62e86763d84201eb69f06c6dab",
+      "reverse:cuda": "fe209b1139dbec8b4f7f857cbce10280b28f393c1d9b4da48a0cb7dc1ea74a53",
+      "bidirectional:cpu": "c7ef6bb875d180ed5fb67610e8ecfc7c67730cb0185c1ae3c96a47af2a17fe89",
+      "bidirectional:cuda": "9b10398f79ffd0f8280c5545f7e88fe90ae9aba6ac3f302f8b44a61b3ea4c9de"
     }
   }
 }

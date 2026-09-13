@@ -37,8 +37,10 @@ from .evaluate import (
     verify_baseline_result_from_prediction_csv,
     write_metrics_json,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from .splits import CellFixedSplitConfig, create_persistent_cell_fixed_split
+from .target import NONNEGATIVE_PREDICTION_SUPPORT_POLICY
 
 KAGGLE_VALIDATION_SCHEMA_VERSION = "cell_msca.kaggle_validation.v1"
 KAGGLE_MANIFEST_SCHEMA_VERSION = "cell_msca.kaggle_run_manifest.v1"
@@ -82,6 +84,7 @@ ARTIFACT_CLASSIFICATIONS = {
     "environment.json": "engineering-only",
     "validation_metrics.json": "validation-only",
     "validation_predictions.csv": "validation-only",
+    "validation_negative_predictions.csv": "validation-only",
     "selected_checkpoint.pt": "validation-only",
     "execution.log": "engineering-only",
 }
@@ -129,6 +132,7 @@ class ValidationRunArtifacts:
     environment_json: Path
     validation_metrics_json: Path
     validation_predictions_csv: Path
+    validation_negative_predictions_csv: Path
     selected_checkpoint: Path
     execution_log: Path
 
@@ -180,6 +184,11 @@ def load_kaggle_validation_config(path: str | Path) -> dict[str, Any]:
         raise TestEvaluationBlockedError(
             "Kaggle runner stage must be validation_only; test access is closed"
         )
+    if (
+        values.get("prediction_support_policy")
+        != NONNEGATIVE_PREDICTION_SUPPORT_POLICY
+    ):
+        raise ValueError("Kaggle prediction support policy is missing or changed")
     if values.get("allowed_materialized_splits") != ["train", "validation"]:
         raise TestEvaluationBlockedError(
             "allowed_materialized_splits must be exactly train and validation"
@@ -982,6 +991,9 @@ def run_kaggle_validation(
         environment_json=run_dir / "environment.json",
         validation_metrics_json=run_dir / "validation_metrics.json",
         validation_predictions_csv=run_dir / "validation_predictions.csv",
+        validation_negative_predictions_csv=(
+            run_dir / "validation_negative_predictions.csv"
+        ),
         selected_checkpoint=run_dir / "selected_checkpoint.pt",
         execution_log=run_dir / "execution.log",
     )
@@ -1006,6 +1018,7 @@ def run_kaggle_validation(
         "split_config_sha256": expected_hashes["split_config_sha256"],
         "preprocessing_sha256": expected_hashes["preprocessing_sha256"],
         "configuration_sha256": configuration_sha256,
+        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
         "config_file_sha256": file_sha256(config_path),
         "git_commit_sha": identity.commit_sha,
         "git_identity_source": identity.source,
@@ -1023,6 +1036,7 @@ def run_kaggle_validation(
         "completion_time_utc": None,
         "allowed_materialized_splits": ["train", "validation"],
         "test_subset_materialized": False,
+        "test_evaluation_performed": False,
         "artifacts": _artifact_manifest(),
     }
     resolved_config = {
@@ -1042,6 +1056,7 @@ def run_kaggle_validation(
             train_seed=train_seed,
             target_scale=target_scale,
         ),
+        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
         "required_hashes": {
             "data_sha256": expected_hashes["data_sha256"],
             "split_sha256": expected_hashes["split_sha256"],
@@ -1124,6 +1139,14 @@ def run_kaggle_validation(
             y_pred_log=evaluation.predictions.pred_log,
             cell_ids=data.validation.cell_ids,
         )
+        write_prediction_support_diagnostic_csv(
+            artifacts.validation_negative_predictions_csv,
+            y_true_original=data.validation.target_original,
+            unprojected_prediction=evaluation.predictions.unprojected_original,
+            final_prediction=evaluation.predictions.pred_original,
+            cell_ids=data.validation.cell_ids,
+            month_ids=data.validation.month_ids,
+        )
         verify_baseline_result_from_prediction_csv(
             artifacts.validation_predictions_csv,
             evaluation.result,
@@ -1133,6 +1156,21 @@ def run_kaggle_validation(
             "artifact_classification": "validation-only",
             "experiment_id": experiment_id,
             "prediction_metric_verification": "passed_including_spearman",
+            "prediction_support_policy": evaluation.result[
+                "prediction_support_policy"
+            ],
+            "pre_projection_negative_count": evaluation.result[
+                "pre_projection_negative_count"
+            ],
+            "pre_projection_negative_fraction": evaluation.result[
+                "pre_projection_negative_fraction"
+            ],
+            "pre_projection_minimum": evaluation.result[
+                "pre_projection_minimum"
+            ],
+            "projection_applied_count": evaluation.result[
+                "projection_applied_count"
+            ],
             "result": evaluation.result,
         }
         write_metrics_json(artifacts.validation_metrics_json, metrics_payload)
@@ -1144,6 +1182,21 @@ def run_kaggle_validation(
             "best_epoch": fitted.contract.best_epoch,
             "inverse_mode": fitted.contract.inverse_mode,
             "smearing_factor": fitted.contract.smearing_factor,
+            "prediction_support_policy": evaluation.result[
+                "prediction_support_policy"
+            ],
+            "pre_projection_negative_count": evaluation.result[
+                "pre_projection_negative_count"
+            ],
+            "pre_projection_negative_fraction": evaluation.result[
+                "pre_projection_negative_fraction"
+            ],
+            "pre_projection_minimum": evaluation.result[
+                "pre_projection_minimum"
+            ],
+            "projection_applied_count": evaluation.result[
+                "projection_applied_count"
+            ],
             "validation_metrics": evaluation.result,
         }
         _atomic_write_json(artifacts.run_manifest_json, completed_manifest)
@@ -1158,6 +1211,7 @@ def run_kaggle_validation(
                 "message": str(error),
             },
             "test_subset_materialized": False,
+            "test_evaluation_performed": False,
         }
         _atomic_write_json(artifacts.run_manifest_json, failed_manifest)
         logger.write(f"run failed: {type(error).__name__}: {error}")

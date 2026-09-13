@@ -20,11 +20,13 @@ from .evaluate import (
     evaluate_baseline_predictions,
     read_prediction_csv,
     validate_baseline_result_row,
+    verify_legacy_projection_identity_from_prediction_csv,
     verify_baseline_result_from_prediction_csv,
     verify_prediction_file_metrics,
     write_baseline_result_json,
     write_metrics_json,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from .metrics import (
     bootstrap_log_space_metrics,
@@ -35,8 +37,11 @@ from .metrics import (
     spearman_correlation,
 )
 from .target import (
+    NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+    PredictionSupportDiagnostics,
     duan_smearing_factor,
     inverse_target,
+    project_nonnegative_predictions,
     target_transform,
 )
 from .splits import (
@@ -119,11 +124,14 @@ __all__ = [
     "inverse_target",
     "metrics_by_space",
     "MODEL_SAMPLE_KEYS",
+    "NONNEGATIVE_PREDICTION_SUPPORT_POLICY",
     "PREPROCESSING_SCHEMA_VERSION",
     "load_persistent_split",
     "LIGHTGBM_MODEL_NAMES",
     "LightGBMConfig",
     "PreprocessingStats",
+    "PredictionSupportDiagnostics",
+    "project_nonnegative_predictions",
     "read_prediction_csv",
     "regression_metrics",
     "SeedConfig",
@@ -140,9 +148,11 @@ __all__ = [
     "ValidationSelection",
     "validate_baseline_result_row",
     "verify_baseline_result_from_prediction_csv",
+    "verify_legacy_projection_identity_from_prediction_csv",
     "verify_prediction_file_metrics",
     "write_metrics_json",
     "write_prediction_csv",
+    "write_prediction_support_diagnostic_csv",
     "write_baseline_result_json",
     "write_split_metadata_for_existing_split",
     "verify_split_integrity",

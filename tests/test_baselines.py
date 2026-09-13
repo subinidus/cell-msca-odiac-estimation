@@ -18,6 +18,9 @@ from cell_msca.baselines import (
     ModelContract,
     TestEvaluationBlockedError,
     TrainMeanConfig,
+    _log_prediction_pair,
+    _original_prediction_pair,
+    _original_unit_mae_metric,
     authorize_test_evaluation,
     create_frozen_baseline_selection,
     evaluate_fitted_baseline,
@@ -31,6 +34,7 @@ from cell_msca.evaluate import (
     BASELINE_RESULT_FIELDS,
     verify_baseline_result_from_prediction_csv,
     write_prediction_csv,
+    write_prediction_support_diagnostic_csv,
 )
 from cell_msca.experiment import (
     BASELINE_SUITE_MODELS,
@@ -427,6 +431,65 @@ class Phase3BaselineTests(unittest.TestCase):
         self.assertAlmostEqual(float(selection.smearing_factor), 2.0)
         self.assertAlmostEqual(selection.validation_original_mae, 0.0)
 
+    def test_identity_and_log_prediction_paths_apply_the_same_support_policy(self) -> None:
+        identity = _original_prediction_pair(
+            np.asarray([-2.0, 3.0]),
+            target_scale=1.0,
+            model_name="lightgbm_raw",
+        )
+        np.testing.assert_array_equal(identity.pred_original, [0.0, 3.0])
+        np.testing.assert_array_equal(identity.unprojected_original, [-2.0, 3.0])
+        np.testing.assert_allclose(identity.pred_log, np.log1p([0.0, 3.0]))
+
+        native_log = np.asarray([-2.0, np.log(4.0)])
+        log_path = _log_prediction_pair(
+            native_log,
+            scale=1.0,
+            mode="median",
+            smearing_factor=None,
+        )
+        np.testing.assert_array_equal(log_path.pred_original, [0.0, 3.0])
+        np.testing.assert_array_equal(log_path.pred_log, native_log)
+
+    def test_early_stopping_and_inverse_selection_use_projected_mae(self) -> None:
+        metric = _original_unit_mae_metric(target_space="original", target_scale=1.0)
+        name, value, higher_is_better = metric(
+            np.asarray([0.0, 2.0]),
+            np.asarray([-4.0, 2.0]),
+        )
+        self.assertEqual(name, "original_unit_mae")
+        self.assertEqual(value, 0.0)
+        self.assertFalse(higher_is_better)
+
+        selection = select_log_inverse_on_validation(
+            train_true_log=np.asarray([0.0, 0.0]),
+            train_pred_log=np.asarray([0.0, 0.0]),
+            validation_true_original=np.asarray([0.0]),
+            validation_pred_log=np.asarray([-2.0]),
+            target_scale=1.0,
+        )
+        self.assertEqual(selection.inverse_mode, "median")
+        self.assertEqual(selection.validation_original_mae, 0.0)
+
+    def test_support_diagnostic_csv_records_changed_rows_and_true_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "negative.csv"
+            true = np.asarray([4.0, 5.0, 6.0])
+            true_before = true.copy()
+            write_prediction_support_diagnostic_csv(
+                path,
+                y_true_original=true,
+                unprojected_prediction=[-1.0, 2.0, -3.0],
+                final_prediction=[0.0, 2.0, 0.0],
+                cell_ids=["a", "b", "c"],
+                month_ids=["2022-01", "2022-01", "2022-02"],
+            )
+            rows = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rows), 3)
+            self.assertIn("a,2022-01,4.0,-1.0,0.0", rows[1])
+            self.assertIn("c,2022-02,6.0,-3.0,0.0", rows[2])
+            np.testing.assert_array_equal(true, true_before)
+
     def test_prediction_csv_reproduces_shared_baseline_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -530,6 +593,7 @@ class Phase3BaselineTests(unittest.TestCase):
                     {
                         "schema_version": "cell_msca.baseline_experiment.v1",
                         "stage": "validation_tuning",
+                        "prediction_support_policy": "nonnegative_max_zero_v1",
                         "project_root": ".",
                         "data": {
                             "npz_glob": "data/*.npz",
@@ -578,6 +642,7 @@ class Phase3BaselineTests(unittest.TestCase):
             self.assertTrue(artifacts.selected_results_json.is_file())
             self.assertTrue(artifacts.manifest_json.is_file())
             self.assertEqual(len(artifacts.prediction_csvs), 5)
+            self.assertEqual(len(artifacts.negative_prediction_csvs), 5)
             candidate_payload = json.loads(
                 artifacts.candidate_results_json.read_text(encoding="utf-8")
             )

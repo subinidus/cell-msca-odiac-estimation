@@ -25,6 +25,12 @@
   ],
   "test_subset_materialized": false,
   "test_evaluation_performed": false,
+  "prediction_support_policy": "nonnegative_max_zero_v1",
+  "pre_projection_negative_count": "replace-at-runtime",
+  "pre_projection_negative_fraction": "replace-at-runtime",
+  "pre_projection_minimum": "replace-at-runtime",
+  "projection_applied_count": "replace-at-runtime",
+  "negative_prediction_diagnostic_csv": "validation_negative_predictions.csv",
   "selection_metric": "validation original-unit MAE",
   "headline_metrics": [
     "original-unit MAE",

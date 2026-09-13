@@ -5,6 +5,7 @@
     "train",
     "validation"
   ],
+  "prediction_support_policy": "nonnegative_max_zero_v1",
   "owner": "assign-gpu-owner",
   "model_family": "cell_msca",
   "reviewed_base_tag": "v0.4.3-kaggle-validation-runner",
@@ -58,10 +59,10 @@
     "split_config_sha256": "b790de004c019af6842da99723c7d608d6a5bfa454d70b3053f26eca4287cb8b",
     "preprocessing_sha256": "35f760ab7a73ae561ae42562889e67cd1ac1143cdfa7ab6a5b3b25352efcc4db",
     "configuration_sha256_by_variant_and_device": {
-      "token_no_attention:cpu": "b1f03d8cfd384eb10e9b0c6113a8b468ec898b68d6451fe6af73a88126fba9b7",
-      "token_no_attention:cuda": "95a395534b005b35335d839df3848c10e8c654d29425ef39f52504301e989001",
-      "bidirectional:cpu": "37dc8ff610d15024bd660429eeb2b74784895ef6cc828b4654cd7ce821aac99c",
-      "bidirectional:cuda": "2924d4447076c9be599b963f291a48026149b6a46d8fdec6e002a2d2e6d2758a"
+      "token_no_attention:cpu": "01c508428b55cfe92ef79e7d8f0eddf8c7e6a1dea7edd409b1b3306e8b42ebf5",
+      "token_no_attention:cuda": "f821d8ecc22e802a334ddaf64575b42dbac26cf46efe49d2426d8b8965a2088a",
+      "bidirectional:cpu": "7008f04eb20544f04448ac3ea1d1dfe0dda165f4d490cff4258abb295b7c0958",
+      "bidirectional:cuda": "e7bc559019188478f8e453778332f7c0108dda101cab35226bb36f8b58b3fc9e"
     }
   }
 }

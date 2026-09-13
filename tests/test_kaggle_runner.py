@@ -131,6 +131,10 @@ class KaggleRunnerContractTests(unittest.TestCase):
         config = load_kaggle_validation_config(self.smoke_config)
         self.assertEqual(config["stage"], "validation_only")
         self.assertEqual(
+            config["prediction_support_policy"],
+            "nonnegative_max_zero_v1",
+        )
+        self.assertEqual(
             config["allowed_materialized_splits"],
             ["train", "validation"],
         )
@@ -454,6 +458,21 @@ class KaggleRunnerContractTests(unittest.TestCase):
             manifest = json.loads(artifacts.run_manifest_json.read_text("utf-8"))
             self.assertEqual(manifest["status"], "completed")
             self.assertFalse(manifest["test_subset_materialized"])
+            self.assertFalse(manifest["test_evaluation_performed"])
+            self.assertEqual(
+                manifest["prediction_support_policy"],
+                "nonnegative_max_zero_v1",
+            )
+            for field in (
+                "pre_projection_negative_count",
+                "pre_projection_negative_fraction",
+                "pre_projection_minimum",
+                "projection_applied_count",
+            ):
+                self.assertIn(field, manifest)
+            self.assertTrue(
+                artifacts.validation_negative_predictions_csv.is_file()
+            )
             self.assertEqual(
                 manifest["git_dirty_state_policy"],
                 ATTACHED_SOURCE_POLICY,
