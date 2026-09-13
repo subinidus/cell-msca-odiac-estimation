@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from numbers import Real
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, MutableMapping, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -61,6 +61,14 @@ LIGHTGBM_CANDIDATES = ("lightgbm_raw", "lightgbm_log1p")
 NEURAL_CANDIDATES = ("cell_msca_bidirectional", "cell_msca_token_no_attention")
 REPEATED_SEEDS = (42, 43, 44)
 NEW_SEEDS = (43, 44)
+SEED42_REQUIRED_ARTIFACT_KEYS = frozenset(
+    {
+        ("lightgbm_raw", 42),
+        ("lightgbm_log1p", 42),
+        ("cell_msca_token_no_attention", 42),
+        ("cell_msca_bidirectional", 42),
+    }
+)
 _LIGHTGBM_CANDIDATE_RESULT_FIELDS = frozenset(
     {
         "validation_original_unit_mae",
@@ -832,22 +840,114 @@ def load_stored_validation_artifact(path: str | Path) -> StoredValidationArtifac
 
 def discover_validation_artifacts(
     root: str | Path,
+    *,
+    required_keys: Collection[tuple[str, int]] | None = None,
+    audit: MutableMapping[str, Any] | None = None,
 ) -> dict[tuple[str, int], StoredValidationArtifact]:
+    """Discover validation artifacts, optionally prefiltering by metrics key.
+
+    With ``required_keys=None`` every candidate retains the historical strict
+    loading behavior.  A required-key filter reads only ``model_name`` and
+    ``train_seed`` from validation metrics before deciding whether the strict
+    artifact loader is relevant.  It never aliases model names.
+    """
+
     artifact_root = Path(root).resolve()
     if not artifact_root.is_dir():
         raise FileNotFoundError(f"validation package directory is missing: {artifact_root}")
+    normalized_required: frozenset[tuple[str, int]] | None = None
+    if required_keys is not None:
+        supplied = tuple(required_keys)
+        normalized: list[tuple[str, int]] = []
+        for key in supplied:
+            if not isinstance(key, tuple) or len(key) != 2:
+                raise ValueError("required artifact keys must be (model_name, train_seed) tuples")
+            model_name, train_seed = key
+            if not isinstance(model_name, str) or not model_name:
+                raise ValueError("required artifact model_name must be a non-empty string")
+            if not isinstance(train_seed, int) or isinstance(train_seed, bool):
+                raise ValueError("required artifact train_seed must be an integer")
+            normalized.append((model_name, train_seed))
+        normalized_required = frozenset(normalized)
+        if not normalized_required:
+            raise ValueError("required artifact keys must not be empty")
+        if len(normalized_required) != len(supplied):
+            raise ValueError("required artifact keys must not contain duplicates")
+
     artifacts: dict[tuple[str, int], StoredValidationArtifact] = {}
+    excluded: list[dict[str, Any]] = []
     for manifest_path in sorted(artifact_root.rglob("run_manifest.json")):
         directory = manifest_path.parent
-        if not (directory / "validation_predictions.csv").is_file():
+        if normalized_required is not None:
+            metrics_path = directory / "validation_metrics.json"
+            if not metrics_path.is_file():
+                raise FileNotFoundError(
+                    f"validation artifact candidate is missing metrics: {metrics_path}"
+                )
+            metrics = _read_json(metrics_path)
+            result = metrics.get("result")
+            if not isinstance(result, dict):
+                raise ValueError(
+                    f"validation metrics result is missing: {metrics_path}"
+                )
+            model_name = result.get("model_name")
+            train_seed = result.get("train_seed")
+            if not isinstance(model_name, str) or not model_name:
+                raise ValueError(
+                    f"validation metrics model_name is invalid: {metrics_path}"
+                )
+            if not isinstance(train_seed, int) or isinstance(train_seed, bool):
+                raise ValueError(
+                    f"validation metrics train_seed is invalid: {metrics_path}"
+                )
+            candidate_key = (model_name, train_seed)
+            if candidate_key not in normalized_required:
+                excluded.append(
+                    {
+                        "directory": str(directory),
+                        "model_name": model_name,
+                        "train_seed": train_seed,
+                        "reason": "not_in_required_keys",
+                    }
+                )
+                continue
+        elif not (directory / "validation_predictions.csv").is_file():
             continue
+
         artifact = load_stored_validation_artifact(directory)
         key = (artifact.model_name, artifact.train_seed)
         if key in artifacts:
             raise ValueError(f"duplicate validation artifact for {key}")
         artifacts[key] = artifact
-    if not artifacts:
+    if normalized_required is not None:
+        missing = normalized_required - set(artifacts)
+        if missing:
+            rendered = sorted(missing)
+            raise ValueError(f"required validation artifacts are missing: {rendered}")
+    elif not artifacts:
         raise ValueError(f"no complete validation artifacts found below {artifact_root}")
+    if audit is not None:
+        audit.clear()
+        audit.update(
+            {
+                "schema_version": "cell_msca.validation_artifact_discovery.v1",
+                "artifact_root": str(artifact_root),
+                "required_filter_applied": normalized_required is not None,
+                "required_keys": (
+                    [
+                        {"model_name": model_name, "train_seed": train_seed}
+                        for model_name, train_seed in sorted(normalized_required)
+                    ]
+                    if normalized_required is not None
+                    else None
+                ),
+                "loaded_keys": [
+                    {"model_name": model_name, "train_seed": train_seed}
+                    for model_name, train_seed in sorted(artifacts)
+                ],
+                "excluded_artifacts": excluded,
+            }
+        )
     return artifacts
 
 
@@ -1353,7 +1453,12 @@ def aggregate_phase5a_results(
     )
     if selection.get("git_commit_sha") != str(expected_new_git_sha).lower():
         raise ValueError("LightGBM selection Git SHA differs from new results")
-    seed42 = discover_validation_artifacts(seed42_package_root)
+    seed42_discovery_audit: dict[str, Any] = {}
+    seed42 = discover_validation_artifacts(
+        seed42_package_root,
+        required_keys=SEED42_REQUIRED_ARTIFACT_KEYS,
+        audit=seed42_discovery_audit,
+    )
     new = discover_validation_artifacts(phase5a_results_root)
     expected_seed42_git = str(values["required_base_git_sha"])
     reference_mae = values["seed42_reference_mae_rounded_6dp"]
@@ -1548,6 +1653,7 @@ def aggregate_phase5a_results(
             "seed42_projection_identity_verified": {
                 model_name: True for model_name in seed42_required
             },
+            "seed42_artifact_discovery": seed42_discovery_audit,
             "complete_cell_rows": int(bootstrap["rows_per_cell"]),
             "test_subset_materialized": False,
             "test_evaluation_performed": False,
