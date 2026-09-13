@@ -60,6 +60,8 @@
     "primary_original_unit": ["mae", "rmse", "r2"],
     "secondary": ["bias", "spearman", "log_unit_mae", "log_unit_rmse", "log_unit_r2"],
     "recalculation_source": "saved_test_prediction_csv_only",
+    "stored_metric_relative_tolerance": 1e-12,
+    "stored_metric_absolute_tolerance": 1e-12,
     "seed_summary_standard_deviation_ddof": 1
   },
   "paired_cell_cluster_bootstrap": {
@@ -82,6 +84,21 @@
     "training_performed": false,
     "model_selection_performed": false,
     "hyperparameter_change_performed": false
+  },
+  "run_registry": {
+    "directory_name": "cell-msca-phase6-final-test-registry",
+    "states": [
+      "claimed",
+      "materialization_started",
+      "materialized",
+      "evaluating",
+      "failed",
+      "completed"
+    ],
+    "claim_creation": "atomic_exclusive_create",
+    "default_existing_claim_policy": "fail_closed",
+    "recovery_allowed": false,
+    "cross_session_enforcement": "execution_receipt_and_research_procedure"
   },
   "prohibited_operations": [
     "training",

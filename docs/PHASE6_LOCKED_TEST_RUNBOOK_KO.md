@@ -36,7 +36,13 @@
 
 seed-42 neural manifest는 이전 schema라 `test_evaluation_performed` 필드가 없다. 이 예외는 정확한 seed-42 ZIP hash와 두 manifest hash에만 한정되며, `test_subset_materialized=false`, Phase 5A aggregation의 closed-gate audit 및 validation prediction identity를 함께 요구한다. 다른 누락은 허용하지 않는다.
 
-모든 검증을 통과하면 persistent split의 test를 실행 중 정확히 한 번 materialize한다. 이어서 2,574 cells, cell당 36개월, 총 92,664 rows인지 확인한다. 출력 경로가 이미 존재하면 빈 디렉터리여도 덮어쓰지 않는다. 서로 다른 작업 공간이나 세션에서 사용자가 출력을 삭제하고 다시 실행하는 행위까지 소프트웨어가 전역적으로 막을 수는 없으므로, 최종 ZIP과 receipt를 보존하고 동일 protocol을 다시 실행하지 않는 운영 통제가 필요하다.
+실행 가능한 gate는 검증된 protocol 없이 만들 수 없다. gate에는 config 파일 SHA-256과 canonical SHA-256, protocol fingerprint, 두 validation package SHA-256, data/split/split-config/preprocessing SHA-256, 실행 source Git SHA, 9개 model/seed 목록 및 deterministic `execution_id`가 고정된다. 실행 함수는 output 디렉터리 생성이나 test materialization 전에 이 정보를 전달된 protocol과 다시 비교한다.
+
+`execution_id`는 output 경로를 포함하지 않는다. 같은 protocol/config, 두 package, data/split/split-config/preprocessing 및 source Git 조합은 항상 같은 ID를 만든다. 로컬에서는 지정한 working root 아래 `cell-msca-phase6-final-test-registry`, Kaggle에서는 고정 경로 `/kaggle/working/cell-msca-phase6-final-test-registry`에 atomic exclusive-create claim을 만든다. 상태는 `claimed → materialization_started → materialized → evaluating → completed`이며, 어느 단계에서든 오류가 나면 `failed`로 종료한다. output 경로를 바꿔도 동일 ID의 `claimed`, `materialized`, `failed`, `completed` claim이 있으면 기본 실행은 중단한다.
+
+test materialization 직전과 직후에 registry를 갱신하고, 직후에는 row/cell/month 수와 `test_subset_materialized=true`를 기록한다. 각 model/seed prediction 완료 후 파일 경로와 SHA-256을 registry에 추가한다. 오류가 발생하면 완료된 model/seed와 artifact SHA, 실패한 model/seed, 예외 유형·메시지를 `phase6_failure_manifest.json`과 registry에 남긴다. `recovery_allowed=false`가 현재 동결 정책이다. `--allow-resume-failed-run`은 명시적으로 존재하지만 별도 승인 전에는 항상 중단하며, 완료 artifact를 자동 재계산하거나 다른 protocol/output 결과와 결합하지 않는다.
+
+모든 검증을 통과하면 persistent split의 test를 실행 중 정확히 한 번 materialize한다. 이어서 2,574 cells, cell당 36개월, 총 92,664 rows인지 확인한다. 출력 경로가 이미 존재하면 빈 디렉터리여도 덮어쓰지 않는다. 중앙 registry가 없는 서로 다른 Kaggle 독립 세션까지 코드만으로 전역 차단한다고 주장하지 않는다. 세션 간 재실행 금지는 최종 execution receipt 보존과 사용자 연구 절차로 관리한다.
 
 ## 실행 명령
 
@@ -73,6 +79,8 @@ CUDA에서 neural inference를 수행하려면 `--device cuda`를 명시한다. 
 - 출력 디렉터리의 sibling final ZIP 및 SHA-256 receipt
 
 Primary metric은 original-unit MAE, RMSE, R²이다. Bias, Spearman과 log-unit MAE/RMSE/R²는 secondary다. 모든 metric은 저장된 test prediction CSV에서 다시 계산한다. Bootstrap은 unique test cell을 복원추출하고 각 선택 cell의 36개월 행을 함께 사용한다. 비교값은 세 frozen seed prediction의 rowwise mean이며, 이 bootstrap은 training-seed uncertainty를 포함하지 않는다.
+
+저장 metric과 CSV 재계산 metric의 수치 비교에만 `relative tolerance=1e-12`, `absolute tolerance=1e-12`를 사용한다. package, prediction, model, manifest SHA-256은 여전히 byte-for-byte 동일해야 한다. metric audit에는 각 metric의 실제 absolute/relative delta와 적용 tolerance를 기록하며 NaN/Inf는 허용하지 않는다.
 
 ## 구현 검증 범위
 

@@ -25,17 +25,19 @@ The target remains the `v1_legacy ODIAC-derived zonal mean`. Phase 6A does not i
 
 ## Gate behavior
 
-The gate validates both ZIP file hashes, safe ZIP member paths, all Phase 5A stages, failed-stage count zero, the closed validation test flags, the validation-MAE LightGBM winner, the nine aggregation identities, each run's provenance and config, each model artifact hash, and safe model loading. It verifies that the current clean Git source descends from the frozen validation code. Only then does it create an authorization and call the persistent protocol's test materializer once.
+The gate validates both ZIP file hashes, safe ZIP member paths, all Phase 5A stages, failed-stage count zero, the closed validation test flags, the validation-MAE LightGBM winner, the nine aggregation identities, each run's provenance and config, each model artifact hash, and safe model loading. It verifies that the current clean Git source descends from the frozen validation code. An executable gate now requires the exact verified protocol and immutably records its config/package/data/split/preprocessing/source/model-set identity plus an output-independent deterministic execution ID. Execution revalidates that identity before creating output or materializing test.
+
+A fixed per-environment registry uses atomic exclusive claim creation and the states `claimed`, `materialization_started`, `materialized`, `evaluating`, `failed`, and `completed`. Materialized row/cell/month counts are recorded immediately after access, and every completed model prediction is recorded with artifact paths and SHA-256 values. Failure records preserve whether test was materialized/evaluated, completed and failed model/seed identities, completed artifact SHA-256 values, and the exception. Failed-run recovery remains disabled and fail-closed; separate Kaggle sessions are governed by preserved receipts and the research execution procedure rather than an unsupported claim of centralized global locking.
 
 The two immutable seed-42 neural manifests predate the explicit `test_evaluation_performed` field. Their narrowly scoped compatibility rule requires the exact package and manifest hashes, `test_subset_materialized=false`, and Phase 5A's completed closed-gate audit. The default rule for every newer artifact remains strict.
 
-After authorization, the runner requires 2,574 unique test cells, 36 months per cell, and 92,664 rows. Each prediction CSV is independently re-read for metric verification. Bootstrap resampling draws unique cells with replacement and carries all 36 monthly rows for each draw. Its interval conditions on the mean of the three frozen-seed predictions and does not include training-seed uncertainty.
+After authorization, the runner requires 2,574 unique test cells, 36 months per cell, and 92,664 rows. Each prediction CSV is independently re-read for metric verification. Stored-versus-recalculated metric comparison alone uses documented `rtol=1e-12` and `atol=1e-12`, with actual deltas recorded; all package and artifact hashes remain exact and non-finite metrics remain invalid. Bootstrap resampling draws unique cells with replacement and carries all 36 monthly rows for each draw. Its interval conditions on the mean of the three frozen-seed predictions and does not include training-seed uncertainty.
 
 ## Verification performed
 
-- Full stored suite: 130 tests passed, 2 skipped, 0 failed, 0 errors.
+- Full stored suite after the review fixes: 139 run; 137 passed, 2 skipped, 0 failed, 0 errors.
   - The skips are the pre-existing optional LightGBM round-trip test in the default environment and an environment-variable-gated external seed-42 ZIP test.
-- New Phase 6A tests: 10 passed.
+- Phase 6A targeted tests: 19 passed. The added counterexamples cover protocol-less and mismatched gates, output-independent duplicate claims, failure before and immediately after materialization, an Nth-model prediction failure, mandatory failure manifests, disabled recovery, frozen-model parameter mutation, forbidden training/selection APIs, and metric tolerance boundaries (`1e-14` accepted, `1e-8` rejected).
 - `compileall src tests`: passed.
 - `git diff --check`: passed.
 - CLI import/help smoke: passed.
@@ -44,6 +46,7 @@ After authorization, the runner requires 2,574 unique test cells, 36 months per 
   - PyTorch 2.13.0+cpu loaded all six checkpoints with `weights_only=True`.
   - NumPy 2.5.2 and SciPy 1.18.1 were used in this isolated preflight.
   - loaded artifact count: 9; failed Phase 5A stage count: 0; test materialized: false.
+  - all nine model-state fingerprints were distinct and stable across an eight-row synthetic CPU inference smoke; no optimizer, backward, fit, early-stopping, tuning, or checkpoint-selection path was called.
 - Legacy flat `src/*.py` changes relative to the Phase 6A base: none.
 
 The LightGBM/SciPy packages used for the actual safe-load check were placed outside the repository in an isolated temporary dependency directory and removed after verification. The global Python environment was not changed.

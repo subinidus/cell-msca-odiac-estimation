@@ -22,7 +22,8 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkstemp
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -38,7 +39,7 @@ from .baselines import (
     TestEvaluationBlockedError,
     evaluate_fitted_baseline,
 )
-from .data import file_sha256
+from .data import canonical_sha256, file_sha256
 from .evaluate import (
     calculate_prediction_metrics_from_csv,
     read_prediction_csv,
@@ -72,6 +73,16 @@ PHASE6_ARTIFACT_KEYS = frozenset(
 _SHA256_LENGTH = 64
 _GIT_SHA_LENGTH = 40
 _PHASE6_GATE_AUTHORITY = object()
+PHASE6_METRIC_REL_TOL = 1e-12
+PHASE6_METRIC_ABS_TOL = 1e-12
+PHASE6_REGISTRY_STATES = (
+    "claimed",
+    "materialization_started",
+    "materialized",
+    "evaluating",
+    "failed",
+    "completed",
+)
 
 
 @dataclass(frozen=True)
@@ -100,12 +111,25 @@ class LoadedFrozenModel:
     spec: FrozenArtifactSpec
     model: Any
     validation_result: Mapping[str, Any]
+    model_state_sha256: str
 
 
 @dataclass(frozen=True)
 class FinalTestGate:
     config: Mapping[str, Any]
     config_sha256: str
+    config_canonical_sha256: str
+    phase5a_package_sha256: str
+    seed42_package_sha256: str
+    data_sha256: str
+    split_sha256: str
+    split_config_sha256: str
+    preprocessing_sha256: str
+    source_git_sha: str
+    evaluation_keys: tuple[tuple[str, int], ...]
+    protocol_fingerprint: str
+    execution_id: str
+    registry_claim_path: Path
     loaded_models: Mapping[tuple[str, int], LoadedFrozenModel]
     audit: Mapping[str, Any]
     _authority: object = field(repr=False, compare=False)
@@ -155,6 +179,239 @@ def _validate_git_sha(value: Any, *, name: str) -> str:
     ):
         raise ValueError(f"{name} must be a 40-character Git SHA")
     return digest
+
+
+def _protocol_identity(protocol: Any) -> dict[str, Any]:
+    if protocol is None or not hasattr(protocol, "provenance"):
+        raise ValueError("an exact verified frozen protocol is required")
+    provenance = protocol.provenance
+    target_scale = float(provenance.target_scale)
+    if not np.isfinite(target_scale) or target_scale <= 0.0:
+        raise ValueError("protocol.target_scale must be finite and positive")
+    return {
+        "data_version": str(provenance.data_version),
+        "data_sha256": _validate_sha256(
+            provenance.data_sha256, name="protocol.data_sha256"
+        ),
+        "split_sha256": _validate_sha256(
+            provenance.split_sha256, name="protocol.split_sha256"
+        ),
+        "split_config_sha256": _validate_sha256(
+            provenance.split_config_sha256, name="protocol.split_config_sha256"
+        ),
+        "preprocessing_sha256": _validate_sha256(
+            provenance.preprocessing_sha256, name="protocol.preprocessing_sha256"
+        ),
+        "split_seed": int(provenance.split_seed),
+        "target_scale": target_scale,
+    }
+
+
+def protocol_fingerprint(protocol: Any) -> str:
+    """Fingerprint only the data/split/preprocessing protocol, never output paths."""
+
+    return canonical_sha256(_protocol_identity(protocol))
+
+
+def deterministic_execution_id(
+    *,
+    config_sha256: str,
+    phase5a_package_sha256: str,
+    seed42_package_sha256: str,
+    data_sha256: str,
+    split_sha256: str,
+    split_config_sha256: str,
+    preprocessing_sha256: str,
+    source_git_sha: str,
+) -> str:
+    """Return the output-path-independent final-test execution identity."""
+
+    payload = {
+        "frozen_protocol_config_sha256": _validate_sha256(
+            config_sha256, name="execution.config_sha256"
+        ),
+        "phase5a_package_sha256": _validate_sha256(
+            phase5a_package_sha256, name="execution.phase5a_package_sha256"
+        ),
+        "seed42_package_sha256": _validate_sha256(
+            seed42_package_sha256, name="execution.seed42_package_sha256"
+        ),
+        "data_sha256": _validate_sha256(data_sha256, name="execution.data_sha256"),
+        "split_sha256": _validate_sha256(split_sha256, name="execution.split_sha256"),
+        "split_config_sha256": _validate_sha256(
+            split_config_sha256, name="execution.split_config_sha256"
+        ),
+        "preprocessing_sha256": _validate_sha256(
+            preprocessing_sha256, name="execution.preprocessing_sha256"
+        ),
+        "source_git_sha": _validate_git_sha(
+            source_git_sha, name="execution.source_git_sha"
+        ),
+    }
+    return f"phase6-final-{canonical_sha256(payload)}"
+
+
+def _model_state_fingerprint(model: Any) -> str:
+    """Hash inference state so Phase 6 can prove parameters stayed frozen."""
+
+    custom = getattr(model, "phase6_state_fingerprint", None)
+    if callable(custom):
+        return _validate_sha256(custom(), name="model.phase6_state_fingerprint")
+
+    estimator = getattr(model, "estimator", None)
+    model_to_string = getattr(estimator, "model_to_string", None)
+    if not callable(model_to_string):
+        model_to_string = getattr(getattr(estimator, "booster_", None), "model_to_string", None)
+    if callable(model_to_string):
+        return _sha256_bytes(model_to_string().encode("utf-8"))
+
+    neural_model = getattr(model, "model", None)
+    state_dict = getattr(neural_model, "state_dict", None)
+    if callable(state_dict):
+        digest = hashlib.sha256()
+        for name, tensor in sorted(state_dict().items()):
+            name_bytes = str(name).encode("utf-8")
+            detached = tensor.detach().cpu().contiguous()
+            metadata = json.dumps(
+                {
+                    "dtype": str(detached.dtype),
+                    "shape": list(detached.shape),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            value_bytes = detached.view(dtype=getattr(importlib.import_module("torch"), "uint8"))
+            raw = value_bytes.numpy().tobytes(order="C")
+            for values in (name_bytes, metadata, raw):
+                digest.update(len(values).to_bytes(8, "big"))
+                digest.update(values)
+        return digest.hexdigest()
+    raise TypeError("frozen model does not expose a supported immutable state")
+
+
+def _gate_identity(gate: FinalTestGate) -> dict[str, Any]:
+    return {
+        "protocol_config_sha256": gate.config_sha256,
+        "protocol_config_canonical_sha256": gate.config_canonical_sha256,
+        "protocol_fingerprint": gate.protocol_fingerprint,
+        "phase5a_package_sha256": gate.phase5a_package_sha256,
+        "seed42_package_sha256": gate.seed42_package_sha256,
+        "data_sha256": gate.data_sha256,
+        "split_sha256": gate.split_sha256,
+        "split_config_sha256": gate.split_config_sha256,
+        "preprocessing_sha256": gate.preprocessing_sha256,
+        "source_git_sha": gate.source_git_sha,
+        "evaluation_keys": [
+            {"model_name": model_name, "train_seed": seed}
+            for model_name, seed in gate.evaluation_keys
+        ],
+        "execution_id": gate.execution_id,
+    }
+
+
+def _atomic_write_json(path: Path, values: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(values, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _read_registry_claim(path: Path) -> dict[str, Any]:
+    try:
+        values = _read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise TestEvaluationBlockedError(
+            f"existing Phase 6 registry claim is unreadable: {path}"
+        ) from error
+    state = values.get("state")
+    if state not in PHASE6_REGISTRY_STATES:
+        raise TestEvaluationBlockedError("existing Phase 6 registry state is invalid")
+    return values
+
+
+def _claim_execution(
+    *,
+    registry_root: Path,
+    execution_id: str,
+    output_dir: Path,
+    gate_identity: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    registry_root.mkdir(parents=True, exist_ok=True)
+    claim_path = registry_root / f"{execution_id}.json"
+    claim = {
+        "schema_version": "cell_msca.phase6_execution_registry.v1",
+        "artifact_classification": "final-test-registry",
+        "execution_id": execution_id,
+        "state": "claimed",
+        "claimed_at_utc": _utc_now(),
+        "output_dir": str(output_dir.resolve()),
+        "gate_identity": dict(gate_identity),
+        "test_subset_materialized": False,
+        "test_evaluation_performed": False,
+        "completed_artifacts": [],
+        "recovery_allowed": False,
+    }
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        descriptor = os.open(claim_path, flags, 0o600)
+    except FileExistsError as error:
+        existing = _read_registry_claim(claim_path)
+        raise TestEvaluationBlockedError(
+            "Phase 6 execution is already claimed; "
+            f"execution_id={execution_id}, state={existing['state']}, "
+            f"output_dir={existing.get('output_dir')}"
+        ) from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(claim, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return claim_path, claim
+
+
+def _transition_registry(
+    claim_path: Path,
+    gate: FinalTestGate,
+    *,
+    state: str,
+    updates: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if state not in PHASE6_REGISTRY_STATES:
+        raise ValueError(f"unsupported Phase 6 registry state: {state}")
+    values = _read_registry_claim(claim_path)
+    if values.get("execution_id") != gate.execution_id:
+        raise TestEvaluationBlockedError("registry execution_id differs from gate")
+    if values.get("gate_identity") != _gate_identity(gate):
+        raise TestEvaluationBlockedError("registry gate identity differs from executable gate")
+    allowed = {
+        "claimed": {"materialization_started", "failed"},
+        "materialization_started": {"materialized", "failed"},
+        "materialized": {"evaluating", "failed"},
+        "evaluating": {"evaluating", "failed", "completed"},
+        "failed": set(),
+        "completed": set(),
+    }
+    previous = str(values["state"])
+    if state not in allowed[previous]:
+        raise TestEvaluationBlockedError(
+            f"invalid Phase 6 registry transition: {previous} -> {state}"
+        )
+    values.update(dict(updates or {}))
+    values["state"] = state
+    values[f"{state}_at_utc"] = _utc_now()
+    _atomic_write_json(claim_path, values)
+    return values
 
 
 def _artifact_spec(values: Mapping[str, Any], *, index: int) -> FrozenArtifactSpec:
@@ -350,6 +607,8 @@ def load_phase6_protocol(path: str | Path) -> dict[str, Any]:
         "primary_original_unit": ["mae", "rmse", "r2"],
         "secondary": ["bias", "spearman", "log_unit_mae", "log_unit_rmse", "log_unit_r2"],
         "recalculation_source": "saved_test_prediction_csv_only",
+        "stored_metric_relative_tolerance": PHASE6_METRIC_REL_TOL,
+        "stored_metric_absolute_tolerance": PHASE6_METRIC_ABS_TOL,
         "seed_summary_standard_deviation_ddof": 1,
     }:
         raise ValueError("Phase 6 metric contract changed")
@@ -378,6 +637,16 @@ def load_phase6_protocol(path: str | Path) -> dict[str, Any]:
         "hyperparameter_change_performed": False,
     }:
         raise ValueError("Phase 6 final-test access contract changed")
+    registry = values.get("run_registry")
+    if registry != {
+        "directory_name": "cell-msca-phase6-final-test-registry",
+        "states": list(PHASE6_REGISTRY_STATES),
+        "claim_creation": "atomic_exclusive_create",
+        "default_existing_claim_policy": "fail_closed",
+        "recovery_allowed": False,
+        "cross_session_enforcement": "execution_receipt_and_research_procedure",
+    }:
+        raise ValueError("Phase 6 run-registry contract changed")
 
     prohibited = set(values.get("prohibited_operations", ()))
     if prohibited != {
@@ -791,12 +1060,18 @@ def _verify_phase5a_evidence(
 
 
 def _validate_protocol_provenance(protocol: Any, config: Mapping[str, Any]) -> None:
+    if protocol is None or not hasattr(protocol, "provenance"):
+        raise ValueError("an exact verified frozen protocol is required")
     provenance = protocol.provenance
     for name, expected in config["required_hashes"].items():
         if getattr(provenance, name) != expected:
             raise ValueError(f"verified project data {name} mismatch")
     if provenance.split_seed != 42:
         raise ValueError("verified project data split seed mismatch")
+    if provenance.data_version != config["data"]["data_version"]:
+        raise ValueError("verified project data version mismatch")
+    if float(provenance.target_scale) != float(config["data"]["target_scale"]):
+        raise ValueError("verified project target scale mismatch")
 
 
 def verify_final_test_gate(
@@ -808,16 +1083,35 @@ def verify_final_test_gate(
     extraction_root: str | Path,
     allow_final_test: bool,
     protocol: Any | None = None,
+    registry_root: str | Path | None = None,
     device: str = "cpu",
     model_loader: ModelLoader | None = None,
     repository_root: str | Path | None = None,
     kaggle: bool = False,
+    allow_resume_failed_run: bool = False,
+    resume_execution_id: str | None = None,
 ) -> FinalTestGate:
     """Verify every frozen condition without materializing the test subset."""
 
     if not allow_final_test:
         raise TestEvaluationBlockedError(
             "locked final-test evaluation requires explicit --allow-final-test"
+        )
+    if protocol is None:
+        raise TestEvaluationBlockedError(
+            "an exact verified frozen protocol is required to create an executable gate"
+        )
+    if repository_root is None:
+        raise TestEvaluationBlockedError(
+            "repository_root is required to bind the gate to an exact source Git SHA"
+        )
+    if registry_root is None:
+        raise TestEvaluationBlockedError(
+            "a fixed Phase 6 run registry root is required"
+        )
+    if allow_resume_failed_run or resume_execution_id is not None:
+        raise TestEvaluationBlockedError(
+            "failed-run recovery is disabled; recovery_allowed=false"
         )
     destination = Path(output_dir)
     if destination.exists():
@@ -837,51 +1131,54 @@ def verify_final_test_gate(
             raise ValueError("Kaggle Phase 6 output must be below /kaggle/working") from error
     config = load_phase6_protocol(config_path)
     config_sha256 = file_sha256(config_path)
-    runner_git_sha: str | None = None
-    if repository_root is not None:
-        repository = Path(repository_root).resolve()
-        runner_git_sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        _validate_git_sha(runner_git_sha, name="runner_git_sha")
-        ancestor = subprocess.run(
-            [
-                "git",
-                "merge-base",
-                "--is-ancestor",
-                str(config["validation_code_git_sha"]),
-                runner_git_sha,
-            ],
-            cwd=repository,
-            check=False,
-        )
-        if ancestor.returncode != 0:
-            raise ValueError("runner source does not descend from the frozen validation code")
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        if dirty.strip():
-            raise RuntimeError("Phase 6 runner requires a clean tracked-and-untracked source tree")
-    if protocol is not None:
-        _validate_protocol_provenance(protocol, config)
+    config_canonical_sha256 = canonical_sha256(config)
+    _validate_protocol_provenance(protocol, config)
+    protocol_identity = _protocol_identity(protocol)
+    frozen_protocol_fingerprint = protocol_fingerprint(protocol)
+    repository = Path(repository_root).resolve()
+    runner_git_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _validate_git_sha(runner_git_sha, name="runner_git_sha")
+    ancestor = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            str(config["validation_code_git_sha"]),
+            runner_git_sha,
+        ],
+        cwd=repository,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise ValueError("runner source does not descend from the frozen validation code")
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if dirty.strip():
+        raise RuntimeError("Phase 6 runner requires a clean tracked-and-untracked source tree")
     package_paths = {
         "phase5a": Path(phase5a_zip),
         "seed42": Path(seed42_zip),
     }
+    package_hashes: dict[str, str] = {}
     for package_name, path in package_paths.items():
         expected = config["validation_packages"][package_name]
         if path.name != expected["file_name"]:
             raise ValueError(f"{package_name} validation package file name mismatch")
-        if file_sha256(path) != expected["file_sha256"]:
+        actual_package_hash = file_sha256(path)
+        if actual_package_hash != expected["file_sha256"]:
             raise ValueError(f"{package_name} validation package SHA-256 mismatch")
+        package_hashes[package_name] = actual_package_hash
 
     extraction = Path(extraction_root)
     extraction.mkdir(parents=True, exist_ok=True)
@@ -933,26 +1230,67 @@ def verify_final_test_gate(
                 archive, inventory, spec, extraction
             )
             model = loader(spec, model_path, validation_result, device)
-            loaded[key] = LoadedFrozenModel(spec, model, validation_result)
+            loaded[key] = LoadedFrozenModel(
+                spec,
+                model,
+                MappingProxyType(dict(validation_result)),
+                _model_state_fingerprint(model),
+            )
     finally:
         for archive in archives.values():
             archive.close()
     if set(loaded) != PHASE6_ARTIFACT_KEYS:
         raise ValueError("safe loading did not produce exactly nine frozen models")
+    evaluation_keys = tuple(sorted(loaded))
+    execution_id = deterministic_execution_id(
+        config_sha256=config_sha256,
+        phase5a_package_sha256=package_hashes["phase5a"],
+        seed42_package_sha256=package_hashes["seed42"],
+        data_sha256=protocol_identity["data_sha256"],
+        split_sha256=protocol_identity["split_sha256"],
+        split_config_sha256=protocol_identity["split_config_sha256"],
+        preprocessing_sha256=protocol_identity["preprocessing_sha256"],
+        source_git_sha=runner_git_sha,
+    )
+    gate_identity = {
+        "protocol_config_sha256": config_sha256,
+        "protocol_config_canonical_sha256": config_canonical_sha256,
+        "protocol_fingerprint": frozen_protocol_fingerprint,
+        "phase5a_package_sha256": package_hashes["phase5a"],
+        "seed42_package_sha256": package_hashes["seed42"],
+        "data_sha256": protocol_identity["data_sha256"],
+        "split_sha256": protocol_identity["split_sha256"],
+        "split_config_sha256": protocol_identity["split_config_sha256"],
+        "preprocessing_sha256": protocol_identity["preprocessing_sha256"],
+        "source_git_sha": runner_git_sha,
+        "evaluation_keys": [
+            {"model_name": model_name, "train_seed": seed}
+            for model_name, seed in evaluation_keys
+        ],
+        "execution_id": execution_id,
+    }
+    registry_claim_path, _ = _claim_execution(
+        registry_root=Path(registry_root),
+        execution_id=execution_id,
+        output_dir=destination,
+        gate_identity=gate_identity,
+    )
     audit = {
         "schema_version": PHASE6_GATE_SCHEMA_VERSION,
         "artifact_classification": "final-test-gate",
         "status": "passed",
         "checked_at_utc": _utc_now(),
-        "config_sha256": config_sha256,
+        **gate_identity,
         "explicit_allow_final_test": True,
         "output_path_was_absent": True,
         "output_sibling_bundle_paths_were_absent": True,
         "runner_git_sha": runner_git_sha,
-        "validation_code_git_sha_is_ancestor": (
-            True if repository_root is not None else "not_checked"
-        ),
+        "validation_code_git_sha_is_ancestor": True,
         "git_dirty_state_policy": "tracked_and_untracked_files",
+        "registry_claim_path": str(registry_claim_path.resolve()),
+        "registry_claim_creation": "atomic_exclusive_create",
+        "registry_existing_claim_policy": "fail_closed",
+        "recovery_allowed": False,
         "packages": package_audit,
         "phase5a_evidence": evidence_audit,
         "expected_artifact_count": 9,
@@ -974,13 +1312,79 @@ def verify_final_test_gate(
         "model_selection_performed": False,
         "hyperparameter_change_performed": False,
     }
-    return FinalTestGate(
-        config=config,
+    gate = FinalTestGate(
+        config=MappingProxyType(config),
         config_sha256=config_sha256,
-        loaded_models=loaded,
-        audit=audit,
+        config_canonical_sha256=config_canonical_sha256,
+        phase5a_package_sha256=package_hashes["phase5a"],
+        seed42_package_sha256=package_hashes["seed42"],
+        data_sha256=protocol_identity["data_sha256"],
+        split_sha256=protocol_identity["split_sha256"],
+        split_config_sha256=protocol_identity["split_config_sha256"],
+        preprocessing_sha256=protocol_identity["preprocessing_sha256"],
+        source_git_sha=runner_git_sha,
+        evaluation_keys=evaluation_keys,
+        protocol_fingerprint=frozen_protocol_fingerprint,
+        execution_id=execution_id,
+        registry_claim_path=registry_claim_path,
+        loaded_models=MappingProxyType(loaded),
+        audit=MappingProxyType(audit),
         _authority=_PHASE6_GATE_AUTHORITY,
     )
+    if _gate_identity(gate) != gate_identity:
+        raise AssertionError("internal Phase 6 gate identity construction mismatch")
+    return gate
+
+
+def _validate_executable_gate(protocol: Any, gate: FinalTestGate) -> dict[str, Any]:
+    """Revalidate the exact frozen protocol and claim before any output or test access."""
+
+    if gate._authority is not _PHASE6_GATE_AUTHORITY:
+        raise TestEvaluationBlockedError("Phase 6 execution requires a verified gate")
+    _validate_protocol_provenance(protocol, gate.config)
+    identity = _protocol_identity(protocol)
+    if protocol_fingerprint(protocol) != gate.protocol_fingerprint:
+        raise TestEvaluationBlockedError("gate and supplied frozen protocol differ")
+    if canonical_sha256(dict(gate.config)) != gate.config_canonical_sha256:
+        raise TestEvaluationBlockedError("gate protocol configuration was modified")
+    if gate.phase5a_package_sha256 != gate.config["validation_packages"]["phase5a"][
+        "file_sha256"
+    ] or gate.seed42_package_sha256 != gate.config["validation_packages"]["seed42"][
+        "file_sha256"
+    ]:
+        raise TestEvaluationBlockedError("gate package identity differs from frozen config")
+    for name in (
+        "data_sha256",
+        "split_sha256",
+        "split_config_sha256",
+        "preprocessing_sha256",
+    ):
+        if getattr(gate, name) != identity[name]:
+            raise TestEvaluationBlockedError(f"gate {name} differs from frozen protocol")
+    if gate.evaluation_keys != tuple(sorted(PHASE6_ARTIFACT_KEYS)) or set(
+        gate.loaded_models
+    ) != PHASE6_ARTIFACT_KEYS:
+        raise TestEvaluationBlockedError("gate evaluation model/seed set changed")
+    expected_execution_id = deterministic_execution_id(
+        config_sha256=gate.config_sha256,
+        phase5a_package_sha256=gate.phase5a_package_sha256,
+        seed42_package_sha256=gate.seed42_package_sha256,
+        data_sha256=gate.data_sha256,
+        split_sha256=gate.split_sha256,
+        split_config_sha256=gate.split_config_sha256,
+        preprocessing_sha256=gate.preprocessing_sha256,
+        source_git_sha=gate.source_git_sha,
+    )
+    if gate.execution_id != expected_execution_id:
+        raise TestEvaluationBlockedError("gate deterministic execution_id is invalid")
+    registry = _read_registry_claim(gate.registry_claim_path)
+    if registry.get("state") != "claimed":
+        raise TestEvaluationBlockedError(
+            f"Phase 6 execution claim is not fresh: state={registry.get('state')}"
+        )
+    if registry.get("gate_identity") != _gate_identity(gate):
+        raise TestEvaluationBlockedError("registry claim does not match executable gate")
+    return registry
 
 
 def _materialize_test_once(protocol: Any, gate: FinalTestGate) -> BaselineArraySplit:
@@ -1039,9 +1443,62 @@ def _phase6_metrics_from_csv(
     spearman = spearman_correlation(
         predictions["true_original"], predictions["pred_original"]
     )
-    verify_baseline_result_from_prediction_csv(prediction_path, full_result)
+    verify_baseline_result_from_prediction_csv(
+        prediction_path,
+        full_result,
+        rtol=PHASE6_METRIC_REL_TOL,
+        atol=PHASE6_METRIC_ABS_TOL,
+    )
     original = recalculated["original_unit"]
     log_space = recalculated["log_space"]
+    pairs = {
+        "original_unit.mae": (
+            float(original["mae"]),
+            float(full_result["headline_metrics"]["original_unit"]["mae"]),
+        ),
+        "original_unit.rmse": (
+            float(original["rmse"]),
+            float(full_result["headline_metrics"]["original_unit"]["rmse"]),
+        ),
+        "original_unit.r2": (
+            float(original["r2"]),
+            float(full_result["headline_metrics"]["original_unit"]["r2"]),
+        ),
+        "original_unit.bias": (
+            float(original["bias"]),
+            float(full_result["headline_metrics"]["original_unit"]["bias"]),
+        ),
+        "log_space.mae": (
+            float(log_space["mae"]),
+            float(full_result["secondary_metrics"]["log_space"]["mae"]),
+        ),
+        "log_space.rmse": (
+            float(log_space["rmse"]),
+            float(full_result["secondary_metrics"]["log_space"]["rmse"]),
+        ),
+        "log_space.r2": (
+            float(log_space["r2"]),
+            float(full_result["secondary_metrics"]["log_space"]["r2"]),
+        ),
+        "log_space.bias": (
+            float(log_space["bias"]),
+            float(full_result["secondary_metrics"]["log_space"]["bias"]),
+        ),
+        "spearman": (
+            float(spearman),
+            float(full_result["secondary_metrics"]["spearman"]),
+        ),
+    }
+    if any(not np.isfinite(value) for pair in pairs.values() for value in pair):
+        raise ValueError("stored and recalculated Phase 6 metrics must be finite")
+    absolute_deltas = {
+        name: abs(recalculated_value - stored_value)
+        for name, (recalculated_value, stored_value) in pairs.items()
+    }
+    relative_deltas = {
+        name: absolute_deltas[name] / max(abs(stored_value), np.finfo(float).tiny)
+        for name, (_, stored_value) in pairs.items()
+    }
     return {
         "primary_original_unit": {
             "mae": float(original["mae"]),
@@ -1056,6 +1513,14 @@ def _phase6_metrics_from_csv(
             "log_unit_r2": float(log_space["r2"]),
         },
         "metric_recalculation_from_saved_prediction_csv": True,
+        "metric_recalculation_tolerance": {
+            "relative": PHASE6_METRIC_REL_TOL,
+            "absolute": PHASE6_METRIC_ABS_TOL,
+        },
+        "metric_recalculation_absolute_deltas": absolute_deltas,
+        "metric_recalculation_relative_deltas": relative_deltas,
+        "metric_recalculation_maximum_absolute_delta": max(absolute_deltas.values()),
+        "metric_recalculation_maximum_relative_delta": max(relative_deltas.values()),
     }
 
 
@@ -1162,208 +1627,358 @@ def execute_locked_final_test(
 ) -> dict[str, Any]:
     """Materialize test once, predict with frozen models, and save final artifacts."""
 
-    if gate._authority is not _PHASE6_GATE_AUTHORITY:
-        raise TestEvaluationBlockedError("Phase 6 execution requires a verified gate")
+    _validate_executable_gate(protocol, gate)
     destination = Path(output_dir)
+    if destination.resolve() != Path(
+        _read_registry_claim(gate.registry_claim_path)["output_dir"]
+    ).resolve():
+        raise TestEvaluationBlockedError("execution output differs from its atomic claim")
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite Phase 6 output: {destination}")
-    destination.mkdir(parents=True, exist_ok=False)
-    protocol_copy = {
-        **dict(gate.config),
-        "source_config_sha256": gate.config_sha256,
-        "artifact_classification": "final-test-protocol",
-    }
-    write_metrics_json(destination / "PHASE6_LOCKED_TEST_PROTOCOL.json", protocol_copy)
-    write_metrics_json(destination / "final_test_gate_audit.json", gate.audit)
+    test_materialized = False
+    evaluation_attempted = False
+    completed_keys: list[dict[str, Any]] = []
+    completed_artifacts: list[dict[str, Any]] = []
+    failed_key: tuple[str, int] | None = None
     log_path = destination / "execution.log"
-    log_path.write_text(
-        f"{_utc_now()} gate_passed; materializing test exactly once\n",
-        encoding="utf-8",
-    )
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+        protocol_copy = {
+            **dict(gate.config),
+            "source_config_sha256": gate.config_sha256,
+            "source_config_canonical_sha256": gate.config_canonical_sha256,
+            "protocol_fingerprint": gate.protocol_fingerprint,
+            "execution_id": gate.execution_id,
+            "artifact_classification": "final-test-protocol",
+        }
+        write_metrics_json(destination / "PHASE6_LOCKED_TEST_PROTOCOL.json", protocol_copy)
+        write_metrics_json(destination / "final_test_gate_audit.json", dict(gate.audit))
+        log_path.write_text(
+            f"{_utc_now()} gate_passed; execution_id={gate.execution_id}\n",
+            encoding="utf-8",
+        )
+        _transition_registry(
+            gate.registry_claim_path,
+            gate,
+            state="materialization_started",
+            updates={
+                "test_subset_materialized": False,
+                "test_evaluation_performed": False,
+                "materialization_started_at_utc": _utc_now(),
+            },
+        )
+        test_split = _materialize_test_once(protocol, gate)
+        test_materialized = True
+        raw_structure = {
+            "materialized_row_count": int(test_split.n_samples),
+            "materialized_unique_cell_count": int(np.unique(test_split.cell_ids).size),
+            "materialized_unique_month_count": int(np.unique(test_split.month_ids).size),
+        }
+        _transition_registry(
+            gate.registry_claim_path,
+            gate,
+            state="materialized",
+            updates={
+                "test_subset_materialized": True,
+                "test_evaluation_performed": False,
+                "execution_id": gate.execution_id,
+                **raw_structure,
+            },
+        )
+        contract = gate.config["test_contract"]
+        structure = validate_test_structure(
+            test_split,
+            expected_cells=int(contract["expected_unique_cells"]),
+            rows_per_cell=int(contract["expected_rows_per_cell"]),
+            expected_samples=int(contract["expected_samples"]),
+        )
+        _transition_registry(
+            gate.registry_claim_path,
+            gate,
+            state="evaluating",
+            updates={"test_structure": structure},
+        )
+        run_metrics: dict[tuple[str, int], Mapping[str, Any]] = {}
+        prediction_paths: dict[tuple[str, int], Path] = {}
+        run_artifacts: list[dict[str, Any]] = []
+        for key in gate.evaluation_keys:
+            failed_key = key
+            loaded = gate.loaded_models[key]
+            spec = loaded.spec
+            if _model_state_fingerprint(loaded.model) != loaded.model_state_sha256:
+                raise TestEvaluationBlockedError(
+                    f"frozen model parameters changed before inference: {key}"
+                )
+            _transition_registry(
+                gate.registry_claim_path,
+                gate,
+                state="evaluating",
+                updates={
+                    "current_model": {"model_name": key[0], "train_seed": key[1]},
+                    "test_evaluation_performed": True,
+                },
+            )
+            evaluation_attempted = True
+            run_dir = destination / "runs" / f"{spec.model_name}_seed{spec.train_seed}"
+            run_dir.mkdir(parents=True, exist_ok=False)
+            run_provenance = BaselineProvenance(
+                data_version=protocol.provenance.data_version,
+                data_sha256=protocol.provenance.data_sha256,
+                split_sha256=protocol.provenance.split_sha256,
+                split_config_sha256=protocol.provenance.split_config_sha256,
+                preprocessing_sha256=protocol.provenance.preprocessing_sha256,
+                split_seed=protocol.provenance.split_seed,
+                train_seed=spec.train_seed,
+                target_scale=protocol.provenance.target_scale,
+            )
+            evaluation = evaluate_fitted_baseline(loaded.model, test_split, run_provenance)
+            if _model_state_fingerprint(loaded.model) != loaded.model_state_sha256:
+                raise TestEvaluationBlockedError(
+                    f"frozen model parameters changed during inference: {key}"
+                )
+            prediction_path = write_prediction_csv(
+                run_dir / "test_predictions.csv",
+                y_true_original=test_split.target_original,
+                y_pred_original=evaluation.predictions.pred_original,
+                y_true_log=test_split.target_log,
+                y_pred_log=evaluation.predictions.pred_log,
+                cell_ids=test_split.cell_ids,
+            )
+            diagnostic_path = write_prediction_support_diagnostic_csv(
+                run_dir / "test_negative_predictions.csv",
+                y_true_original=test_split.target_original,
+                unprojected_prediction=evaluation.predictions.unprojected_original,
+                final_prediction=evaluation.predictions.pred_original,
+                cell_ids=test_split.cell_ids,
+                month_ids=test_split.month_ids,
+            )
+            metrics = _phase6_metrics_from_csv(prediction_path, evaluation.result)
+            support = evaluation.predictions.support_diagnostics
+            assert support is not None
+            prediction_sha256 = file_sha256(prediction_path)
+            payload = {
+                "schema_version": PHASE6_METRICS_SCHEMA_VERSION,
+                "artifact_classification": "final-test",
+                "execution_id": gate.execution_id,
+                "model_name": spec.model_name,
+                "train_seed": spec.train_seed,
+                "split_seed": 42,
+                "data_sha256": protocol.provenance.data_sha256,
+                "split_sha256": protocol.provenance.split_sha256,
+                "split_config_sha256": protocol.provenance.split_config_sha256,
+                "preprocessing_sha256": protocol.provenance.preprocessing_sha256,
+                "configuration_sha256": spec.configuration_sha256,
+                "source_model_artifact_sha256": spec.model_artifact_sha256,
+                "frozen_model_state_sha256": loaded.model_state_sha256,
+                "prediction_sha256": prediction_sha256,
+                **metrics,
+                **support.to_dict(),
+                "test_subset_materialized": True,
+                "test_evaluation_performed": True,
+                "training_performed": False,
+                "model_selection_performed": False,
+                "hyperparameter_change_performed": False,
+            }
+            metrics_path = write_metrics_json(run_dir / "test_metrics.json", payload)
+            manifest_path = write_metrics_json(
+                run_dir / "run_manifest.json",
+                {
+                    **payload,
+                    "schema_version": PHASE6_MANIFEST_SCHEMA_VERSION,
+                    "test_prediction_file": prediction_path.name,
+                    "negative_prediction_diagnostic_file": diagnostic_path.name,
+                    "source_validation_manifest_sha256": spec.manifest_sha256,
+                    "source_validation_prediction_sha256": spec.validation_prediction_sha256,
+                    "completed_at_utc": _utc_now(),
+                },
+            )
+            run_metrics[key] = metrics
+            prediction_paths[key] = prediction_path
+            artifact_files = {
+                "prediction": prediction_path,
+                "metrics": metrics_path,
+                "manifest": manifest_path,
+                "negative_prediction_diagnostic": diagnostic_path,
+            }
+            artifact_record = {
+                "model_name": spec.model_name,
+                "train_seed": spec.train_seed,
+                "files": {
+                    name: {"path": str(path.resolve()), "sha256": file_sha256(path)}
+                    for name, path in artifact_files.items()
+                },
+                "model_artifact_sha256": spec.model_artifact_sha256,
+            }
+            run_artifacts.append(
+                {
+                    "model_name": spec.model_name,
+                    "train_seed": spec.train_seed,
+                    "prediction_sha256": prediction_sha256,
+                    "model_artifact_sha256": spec.model_artifact_sha256,
+                }
+            )
+            completed_keys.append(
+                {"model_name": spec.model_name, "train_seed": spec.train_seed}
+            )
+            completed_artifacts.append(artifact_record)
+            _transition_registry(
+                gate.registry_claim_path,
+                gate,
+                state="evaluating",
+                updates={
+                    "completed_model_seeds": completed_keys,
+                    "completed_artifacts": completed_artifacts,
+                },
+            )
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"{_utc_now()} completed {spec.model_name} seed {spec.train_seed}\n"
+                )
+            failed_key = None
 
-    test_split = _materialize_test_once(protocol, gate)
-    contract = gate.config["test_contract"]
-    structure = validate_test_structure(
-        test_split,
-        expected_cells=int(contract["expected_unique_cells"]),
-        rows_per_cell=int(contract["expected_rows_per_cell"]),
-        expected_samples=int(contract["expected_samples"]),
-    )
-    run_metrics: dict[tuple[str, int], Mapping[str, Any]] = {}
-    prediction_paths: dict[tuple[str, int], Path] = {}
-    run_artifacts: list[dict[str, Any]] = []
-    for key in sorted(gate.loaded_models):
-        loaded = gate.loaded_models[key]
-        spec = loaded.spec
-        run_dir = destination / "runs" / f"{spec.model_name}_seed{spec.train_seed}"
-        run_dir.mkdir(parents=True, exist_ok=False)
-        run_provenance = BaselineProvenance(
-            data_version=protocol.provenance.data_version,
-            data_sha256=protocol.provenance.data_sha256,
-            split_sha256=protocol.provenance.split_sha256,
-            split_config_sha256=protocol.provenance.split_config_sha256,
-            preprocessing_sha256=protocol.provenance.preprocessing_sha256,
-            split_seed=protocol.provenance.split_seed,
-            train_seed=spec.train_seed,
-            target_scale=protocol.provenance.target_scale,
+        ddof = int(gate.config["metrics"]["seed_summary_standard_deviation_ddof"])
+        summaries = _aggregate_seed_metrics(run_metrics, ddof=ddof)
+        write_metrics_json(
+            destination / "test_seed_metric_summary.json",
+            {
+                "schema_version": PHASE6_SUMMARY_SCHEMA_VERSION,
+                "artifact_classification": "final-test",
+                "models": summaries,
+            },
         )
-        evaluation = evaluate_fitted_baseline(loaded.model, test_split, run_provenance)
-        prediction_path = write_prediction_csv(
-            run_dir / "test_predictions.csv",
-            y_true_original=test_split.target_original,
-            y_pred_original=evaluation.predictions.pred_original,
-            y_true_log=test_split.target_log,
-            y_pred_log=evaluation.predictions.pred_log,
-            cell_ids=test_split.cell_ids,
+        cell_ids, true_original, means = _verify_prediction_alignment(prediction_paths)
+        bootstrap = gate.config["paired_cell_cluster_bootstrap"]
+        comparisons = {
+            "bidirectional_vs_token_no_attention": paired_cell_cluster_mae_difference(
+                y_true_original=true_original,
+                bidirectional_prediction=means["cell_msca_bidirectional"],
+                comparator_prediction=means["cell_msca_token_no_attention"],
+                cell_ids=cell_ids,
+                n_boot=int(bootstrap["n_boot"]),
+                seed=int(bootstrap["seed"]),
+                alpha=float(bootstrap["alpha"]),
+                rows_per_cell=int(bootstrap["rows_per_cell"]),
+            ),
+            "bidirectional_vs_lightgbm_raw": paired_cell_cluster_mae_difference(
+                y_true_original=true_original,
+                bidirectional_prediction=means["cell_msca_bidirectional"],
+                comparator_prediction=means["lightgbm_raw"],
+                cell_ids=cell_ids,
+                n_boot=int(bootstrap["n_boot"]),
+                seed=int(bootstrap["seed"]),
+                alpha=float(bootstrap["alpha"]),
+                rows_per_cell=int(bootstrap["rows_per_cell"]),
+            ),
+        }
+        write_metrics_json(
+            destination / "paired_test_cell_cluster_bootstrap.json",
+            {
+                "schema_version": PHASE6_BOOTSTRAP_SCHEMA_VERSION,
+                "artifact_classification": "final-test",
+                "prediction_basis": bootstrap["prediction_basis"],
+                "comparisons": comparisons,
+                "limitation": (
+                    "Complete-cell resampling conditions on rowwise mean predictions "
+                    "from three frozen training seeds; it does not include "
+                    "training-seed uncertainty."
+                ),
+            },
         )
-        diagnostic_path = write_prediction_support_diagnostic_csv(
-            run_dir / "test_negative_predictions.csv",
-            y_true_original=test_split.target_original,
-            unprojected_prediction=evaluation.predictions.unprojected_original,
-            final_prediction=evaluation.predictions.pred_original,
-            cell_ids=test_split.cell_ids,
-            month_ids=test_split.month_ids,
-        )
-        metrics = _phase6_metrics_from_csv(prediction_path, evaluation.result)
-        support = evaluation.predictions.support_diagnostics
-        assert support is not None
-        prediction_sha256 = file_sha256(prediction_path)
-        payload = {
-            "schema_version": PHASE6_METRICS_SCHEMA_VERSION,
+        manifest = {
+            "schema_version": PHASE6_MANIFEST_SCHEMA_VERSION,
             "artifact_classification": "final-test",
-            "model_name": spec.model_name,
-            "train_seed": spec.train_seed,
-            "split_seed": 42,
+            "status": "completed",
+            "execution_id": gate.execution_id,
+            "protocol_config_sha256": gate.config_sha256,
+            "protocol_config_canonical_sha256": gate.config_canonical_sha256,
+            "protocol_fingerprint": gate.protocol_fingerprint,
+            "validation_code_git_sha": gate.config["validation_code_git_sha"],
+            "runner_git_sha": gate.source_git_sha,
             "data_sha256": protocol.provenance.data_sha256,
             "split_sha256": protocol.provenance.split_sha256,
             "split_config_sha256": protocol.provenance.split_config_sha256,
             "preprocessing_sha256": protocol.provenance.preprocessing_sha256,
-            "configuration_sha256": spec.configuration_sha256,
-            "source_model_artifact_sha256": spec.model_artifact_sha256,
-            "prediction_sha256": prediction_sha256,
-            **metrics,
-            **support.to_dict(),
+            "test_structure": structure,
+            "test_materialization_count": 1,
             "test_subset_materialized": True,
             "test_evaluation_performed": True,
             "training_performed": False,
             "model_selection_performed": False,
             "hyperparameter_change_performed": False,
+            "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
+            "prediction_metrics_recalculated_from_saved_csv": True,
+            "prediction_alignment_verified": True,
+            "run_artifacts": run_artifacts,
+            "runtime": {
+                "python": platform.python_version(),
+                "numpy": np.__version__,
+                "platform": platform.platform(),
+                "pytorch": _distribution_version("torch"),
+                "lightgbm": _distribution_version("lightgbm"),
+            },
+            "completed_at_utc": _utc_now(),
         }
-        write_metrics_json(run_dir / "test_metrics.json", payload)
-        write_metrics_json(
-            run_dir / "run_manifest.json",
-            {
-                **payload,
-                "schema_version": PHASE6_MANIFEST_SCHEMA_VERSION,
-                "test_prediction_file": prediction_path.name,
-                "negative_prediction_diagnostic_file": diagnostic_path.name,
-                "source_validation_manifest_sha256": spec.manifest_sha256,
-                "source_validation_prediction_sha256": spec.validation_prediction_sha256,
-                "completed_at_utc": _utc_now(),
+        write_metrics_json(destination / "phase6_test_manifest.json", manifest)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{_utc_now()} aggregation_and_bootstrap_completed\n")
+        zip_path, receipt_path, zip_sha256 = _write_final_zip(destination)
+        _transition_registry(
+            gate.registry_claim_path,
+            gate,
+            state="completed",
+            updates={
+                "test_subset_materialized": True,
+                "test_evaluation_performed": True,
+                "completed_model_seeds": completed_keys,
+                "completed_artifacts": completed_artifacts,
+                "final_zip": {
+                    "path": str(zip_path.resolve()),
+                    "sha256": zip_sha256,
+                    "receipt_path": str(receipt_path.resolve()),
+                },
             },
         )
-        run_metrics[key] = metrics
-        prediction_paths[key] = prediction_path
-        run_artifacts.append(
-            {
-                "model_name": spec.model_name,
-                "train_seed": spec.train_seed,
-                "prediction_sha256": prediction_sha256,
-                "model_artifact_sha256": spec.model_artifact_sha256,
-            }
-        )
-        with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{_utc_now()} completed {spec.model_name} seed {spec.train_seed}\n")
-
-    ddof = int(gate.config["metrics"]["seed_summary_standard_deviation_ddof"])
-    summaries = _aggregate_seed_metrics(run_metrics, ddof=ddof)
-    write_metrics_json(
-        destination / "test_seed_metric_summary.json",
-        {
-            "schema_version": PHASE6_SUMMARY_SCHEMA_VERSION,
-            "artifact_classification": "final-test",
-            "models": summaries,
-        },
-    )
-    cell_ids, true_original, means = _verify_prediction_alignment(prediction_paths)
-    bootstrap = gate.config["paired_cell_cluster_bootstrap"]
-    comparisons = {
-        "bidirectional_vs_token_no_attention": paired_cell_cluster_mae_difference(
-            y_true_original=true_original,
-            bidirectional_prediction=means["cell_msca_bidirectional"],
-            comparator_prediction=means["cell_msca_token_no_attention"],
-            cell_ids=cell_ids,
-            n_boot=int(bootstrap["n_boot"]),
-            seed=int(bootstrap["seed"]),
-            alpha=float(bootstrap["alpha"]),
-            rows_per_cell=int(bootstrap["rows_per_cell"]),
-        ),
-        "bidirectional_vs_lightgbm_raw": paired_cell_cluster_mae_difference(
-            y_true_original=true_original,
-            bidirectional_prediction=means["cell_msca_bidirectional"],
-            comparator_prediction=means["lightgbm_raw"],
-            cell_ids=cell_ids,
-            n_boot=int(bootstrap["n_boot"]),
-            seed=int(bootstrap["seed"]),
-            alpha=float(bootstrap["alpha"]),
-            rows_per_cell=int(bootstrap["rows_per_cell"]),
-        ),
-    }
-    write_metrics_json(
-        destination / "paired_test_cell_cluster_bootstrap.json",
-        {
-            "schema_version": PHASE6_BOOTSTRAP_SCHEMA_VERSION,
-            "artifact_classification": "final-test",
-            "prediction_basis": bootstrap["prediction_basis"],
-            "comparisons": comparisons,
-            "limitation": (
-                "Complete-cell resampling conditions on rowwise mean predictions "
-                "from three frozen training seeds; it does not include training-seed uncertainty."
+        return {
+            "output_dir": str(destination),
+            "final_zip": str(zip_path),
+            "final_zip_sha256_receipt": str(receipt_path),
+            "final_zip_sha256": zip_sha256,
+            "execution_id": gate.execution_id,
+            "manifest": manifest,
+        }
+    except Exception as error:
+        failure = {
+            "schema_version": "cell_msca.phase6_failure_manifest.v1",
+            "artifact_classification": "final-test-failure",
+            "status": "failed",
+            "execution_id": gate.execution_id,
+            "test_subset_materialized": test_materialized,
+            "test_evaluation_performed": evaluation_attempted,
+            "completed_model_seeds": completed_keys,
+            "completed_artifacts": completed_artifacts,
+            "failed_model_seed": (
+                None
+                if failed_key is None
+                else {"model_name": failed_key[0], "train_seed": failed_key[1]}
             ),
-        },
-    )
-    manifest = {
-        "schema_version": PHASE6_MANIFEST_SCHEMA_VERSION,
-        "artifact_classification": "final-test",
-        "status": "completed",
-        "protocol_config_sha256": gate.config_sha256,
-        "validation_code_git_sha": gate.config["validation_code_git_sha"],
-        "runner_git_sha": gate.audit.get("runner_git_sha"),
-        "data_sha256": protocol.provenance.data_sha256,
-        "split_sha256": protocol.provenance.split_sha256,
-        "split_config_sha256": protocol.provenance.split_config_sha256,
-        "preprocessing_sha256": protocol.provenance.preprocessing_sha256,
-        "test_structure": structure,
-        "test_materialization_count": 1,
-        "test_subset_materialized": True,
-        "test_evaluation_performed": True,
-        "training_performed": False,
-        "model_selection_performed": False,
-        "hyperparameter_change_performed": False,
-        "prediction_support_policy": NONNEGATIVE_PREDICTION_SUPPORT_POLICY,
-        "prediction_metrics_recalculated_from_saved_csv": True,
-        "prediction_alignment_verified": True,
-        "run_artifacts": run_artifacts,
-        "runtime": {
-            "python": platform.python_version(),
-            "numpy": np.__version__,
-            "platform": platform.platform(),
-            "pytorch": _distribution_version("torch"),
-            "lightgbm": _distribution_version("lightgbm"),
-        },
-        "completed_at_utc": _utc_now(),
-    }
-    write_metrics_json(destination / "phase6_test_manifest.json", manifest)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"{_utc_now()} aggregation_and_bootstrap_completed\n")
-    zip_path, receipt_path, zip_sha256 = _write_final_zip(destination)
-    return {
-        "output_dir": str(destination),
-        "final_zip": str(zip_path),
-        "final_zip_sha256_receipt": str(receipt_path),
-        "final_zip_sha256": zip_sha256,
-        "manifest": manifest,
-    }
+            "exception_type": type(error).__name__,
+            "exception_message": str(error),
+            "recovery_allowed": False,
+            "failed_at_utc": _utc_now(),
+        }
+        try:
+            registry = _read_registry_claim(gate.registry_claim_path)
+            if registry["state"] not in {"failed", "completed"}:
+                _transition_registry(
+                    gate.registry_claim_path,
+                    gate,
+                    state="failed",
+                    updates=failure,
+                )
+        finally:
+            if destination.is_dir():
+                _atomic_write_json(destination / "phase6_failure_manifest.json", failure)
+        raise
 
 
 def run_locked_final_test(
@@ -1379,6 +1994,8 @@ def run_locked_final_test(
     device: str,
     kaggle: bool = False,
     model_loader: ModelLoader | None = None,
+    allow_resume_failed_run: bool = False,
+    resume_execution_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the frozen protocol; no fit or selection function is reachable here."""
 
@@ -1386,11 +2003,20 @@ def run_locked_final_test(
         raise TestEvaluationBlockedError(
             "locked final-test evaluation requires explicit --allow-final-test"
         )
+    if allow_resume_failed_run or resume_execution_id is not None:
+        raise TestEvaluationBlockedError(
+            "failed-run recovery is disabled; recovery_allowed=false"
+        )
     if Path(output_dir).exists():
         raise FileExistsError(f"refusing to overwrite Phase 6 output: {output_dir}")
     config = load_phase6_protocol(config_path)
     repository = Path(repository_root).resolve()
     manifest_path = repository / str(config["data"]["archive_manifest"])
+    registry_root = (
+        Path("/kaggle/working") / str(config["run_registry"]["directory_name"])
+        if kaggle
+        else Path(working_root).resolve() / str(config["run_registry"]["directory_name"])
+    )
     with verified_v1_input(
         input_root=input_root,
         working_root=working_root,
@@ -1409,10 +2035,13 @@ def run_locked_final_test(
             extraction_root=temporary,
             allow_final_test=allow_final_test,
             protocol=verified.protocol,
+            registry_root=registry_root,
             device=device,
             model_loader=model_loader,
             repository_root=repository,
             kaggle=kaggle,
+            allow_resume_failed_run=allow_resume_failed_run,
+            resume_execution_id=resume_execution_id,
         )
         return execute_locked_final_test(
             protocol=verified.protocol,
@@ -1435,6 +2064,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
     parser.add_argument("--kaggle", action="store_true")
     parser.add_argument("--allow-final-test", action="store_true")
+    parser.add_argument(
+        "--allow-resume-failed-run",
+        action="store_true",
+        help="Reserved explicit recovery request; Phase 6A currently fails closed.",
+    )
+    parser.add_argument("--resume-execution-id")
     return parser
 
 
@@ -1451,6 +2086,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_final_test=arguments.allow_final_test,
         device=arguments.device,
         kaggle=arguments.kaggle,
+        allow_resume_failed_run=arguments.allow_resume_failed_run,
+        resume_execution_id=arguments.resume_execution_id,
     )
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0
