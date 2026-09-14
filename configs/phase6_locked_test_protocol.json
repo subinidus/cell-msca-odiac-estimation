@@ -87,18 +87,27 @@
   },
   "run_registry": {
     "directory_name": ".cell_msca_phase6_final_test_registry",
-    "states": [
+    "scientific_states": [
       "claimed",
       "materialization_started",
       "materialized",
       "evaluating",
-      "finalizing",
-      "failed",
-      "completed"
+      "completed",
+      "failed"
+    ],
+    "publish_states": [
+      "not_started",
+      "staging",
+      "ready",
+      "publishing",
+      "published",
+      "publish_failed"
     ],
     "claim_creation": "atomic_exclusive_create",
     "default_existing_claim_policy": "fail_closed",
     "recovery_allowed": false,
+    "publish_recovery_allowed": true,
+    "publish_strategy": "single_atomic_directory_rename_same_filesystem",
     "cross_session_enforcement": "execution_receipt_and_research_procedure"
   },
   "prohibited_operations": [

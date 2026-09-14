@@ -76,14 +76,21 @@ _GIT_SHA_LENGTH = 40
 _PHASE6_GATE_AUTHORITY = object()
 PHASE6_METRIC_REL_TOL = 1e-12
 PHASE6_METRIC_ABS_TOL = 1e-12
-PHASE6_REGISTRY_STATES = (
+PHASE6_SCIENTIFIC_STATES = (
     "claimed",
     "materialization_started",
     "materialized",
     "evaluating",
-    "finalizing",
-    "failed",
     "completed",
+    "failed",
+)
+PHASE6_PUBLISH_STATES = (
+    "not_started",
+    "staging",
+    "ready",
+    "publishing",
+    "published",
+    "publish_failed",
 )
 PHASE6_KAGGLE_REGISTRY_ROOT = Path(
     "/kaggle/working/.cell_msca_phase6_final_test_registry"
@@ -148,13 +155,11 @@ class FinalTestGate:
 
 @dataclass(frozen=True)
 class StagedFinalBundle:
-    staging_root: Path
+    bundle_dir: Path
+    public_bundle_dir: Path
     success_manifest: Path
     zip_path: Path
     receipt_path: Path
-    public_success_manifest: Path
-    public_zip_path: Path
-    public_receipt_path: Path
     sha256_by_name: Mapping[str, str]
 
 
@@ -290,7 +295,7 @@ def deterministic_execution_id(
             source_git_sha, name="execution.source_git_sha"
         ),
     }
-    return f"phase6-final-{canonical_sha256(payload)}"
+    return canonical_sha256(payload)
 
 
 def _model_state_fingerprint(model: Any) -> str:
@@ -378,9 +383,16 @@ def _read_registry_claim(path: Path) -> dict[str, Any]:
         raise TestEvaluationBlockedError(
             f"existing Phase 6 registry claim is unreadable: {path}"
         ) from error
-    state = values.get("state")
-    if state not in PHASE6_REGISTRY_STATES:
-        raise TestEvaluationBlockedError("existing Phase 6 registry state is invalid")
+    scientific_state = values.get("scientific_state")
+    publish_state = values.get("publish_state")
+    if scientific_state not in PHASE6_SCIENTIFIC_STATES:
+        raise TestEvaluationBlockedError(
+            "existing Phase 6 scientific registry state is invalid"
+        )
+    if publish_state not in PHASE6_PUBLISH_STATES:
+        raise TestEvaluationBlockedError(
+            "existing Phase 6 publish registry state is invalid"
+        )
     return values
 
 
@@ -393,13 +405,31 @@ def _claim_execution(
 ) -> tuple[Path, dict[str, Any]]:
     registry_root.mkdir(parents=True, exist_ok=True)
     claim_path = registry_root / f"{execution_id}.json"
+    staging_bundle_dir = registry_root / ".staging" / execution_id / "bundle"
+    public_bundle_dir = registry_root / "published" / execution_id
+    if claim_path.exists():
+        existing = _read_registry_claim(claim_path)
+        raise TestEvaluationBlockedError(
+            "Phase 6 execution is already claimed; "
+            f"execution_id={execution_id}, "
+            f"scientific_state={existing['scientific_state']}, "
+            f"publish_state={existing['publish_state']}, "
+            f"output_dir={existing.get('output_dir')}"
+        )
+    if staging_bundle_dir.exists() or public_bundle_dir.exists():
+        raise TestEvaluationBlockedError(
+            "Phase 6 staging or published destination already exists without a fresh claim"
+        )
     claim = {
-        "schema_version": "cell_msca.phase6_execution_registry.v1",
+        "schema_version": "cell_msca.phase6_execution_registry.v2",
         "artifact_classification": "final-test-registry",
         "execution_id": execution_id,
-        "state": "claimed",
+        "scientific_state": "claimed",
+        "publish_state": "not_started",
         "claimed_at_utc": _utc_now(),
         "output_dir": str(output_dir.resolve()),
+        "staging_bundle_dir": str(staging_bundle_dir.resolve()),
+        "public_bundle_dir": str(public_bundle_dir.resolve()),
         "gate_identity": dict(gate_identity),
         "test_subset_materialized": False,
         "test_evaluation_performed": False,
@@ -413,7 +443,9 @@ def _claim_execution(
         existing = _read_registry_claim(claim_path)
         raise TestEvaluationBlockedError(
             "Phase 6 execution is already claimed; "
-            f"execution_id={execution_id}, state={existing['state']}, "
+            f"execution_id={execution_id}, "
+            f"scientific_state={existing['scientific_state']}, "
+            f"publish_state={existing['publish_state']}, "
             f"output_dir={existing.get('output_dir')}"
         ) from error
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -431,8 +463,8 @@ def _transition_registry(
     state: str,
     updates: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if state not in PHASE6_REGISTRY_STATES:
-        raise ValueError(f"unsupported Phase 6 registry state: {state}")
+    if state not in PHASE6_SCIENTIFIC_STATES:
+        raise ValueError(f"unsupported Phase 6 scientific state: {state}")
     values = _read_registry_claim(claim_path)
     if values.get("execution_id") != gate.execution_id:
         raise TestEvaluationBlockedError("registry execution_id differs from gate")
@@ -442,19 +474,58 @@ def _transition_registry(
         "claimed": {"materialization_started", "failed"},
         "materialization_started": {"materialized", "failed"},
         "materialized": {"evaluating", "failed"},
-        "evaluating": {"evaluating", "finalizing", "failed"},
-        "finalizing": {"failed", "completed"},
+        "evaluating": {"evaluating", "completed", "failed"},
         "failed": set(),
         "completed": set(),
     }
-    previous = str(values["state"])
+    previous = str(values["scientific_state"])
     if state not in allowed[previous]:
         raise TestEvaluationBlockedError(
             f"invalid Phase 6 registry transition: {previous} -> {state}"
         )
     values.update(dict(updates or {}))
-    values["state"] = state
-    values[f"{state}_at_utc"] = _utc_now()
+    values["scientific_state"] = state
+    values[f"scientific_{state}_at_utc"] = _utc_now()
+    _atomic_write_json(claim_path, values)
+    return values
+
+
+def _transition_publish_registry(
+    claim_path: Path,
+    gate: FinalTestGate | None,
+    *,
+    state: str,
+    updates: Mapping[str, Any] | None = None,
+    execution_id: str | None = None,
+) -> dict[str, Any]:
+    if state not in PHASE6_PUBLISH_STATES:
+        raise ValueError(f"unsupported Phase 6 publish state: {state}")
+    values = _read_registry_claim(claim_path)
+    expected_execution_id = gate.execution_id if gate is not None else execution_id
+    if expected_execution_id is None or values.get("execution_id") != expected_execution_id:
+        raise TestEvaluationBlockedError("registry execution_id differs from gate")
+    if gate is not None and values.get("gate_identity") != _gate_identity(gate):
+        raise TestEvaluationBlockedError("registry gate identity differs from executable gate")
+    if values.get("scientific_state") != "completed":
+        raise TestEvaluationBlockedError(
+            "publish state cannot advance before scientific execution completes"
+        )
+    allowed = {
+        "not_started": {"staging", "publish_failed"},
+        "staging": {"ready", "publish_failed"},
+        "ready": {"publishing", "publish_failed"},
+        "publishing": {"published", "publish_failed"},
+        "publish_failed": {"staging", "ready", "publishing", "published"},
+        "published": set(),
+    }
+    previous = str(values["publish_state"])
+    if state not in allowed[previous]:
+        raise TestEvaluationBlockedError(
+            f"invalid Phase 6 publish transition: {previous} -> {state}"
+        )
+    values.update(dict(updates or {}))
+    values["publish_state"] = state
+    values[f"publish_{state}_at_utc"] = _utc_now()
     _atomic_write_json(claim_path, values)
     return values
 
@@ -466,7 +537,10 @@ def _update_completed_registry(
     updates: Mapping[str, Any],
 ) -> dict[str, Any]:
     values = _read_registry_claim(claim_path)
-    if values.get("execution_id") != execution_id or values.get("state") != "completed":
+    if (
+        values.get("execution_id") != execution_id
+        or values.get("scientific_state") != "completed"
+    ):
         raise TestEvaluationBlockedError(
             "publish-only recovery requires the exact completed execution registry"
         )
@@ -702,10 +776,13 @@ def load_phase6_protocol(path: str | Path) -> dict[str, Any]:
     registry = values.get("run_registry")
     if registry != {
         "directory_name": ".cell_msca_phase6_final_test_registry",
-        "states": list(PHASE6_REGISTRY_STATES),
+        "scientific_states": list(PHASE6_SCIENTIFIC_STATES),
+        "publish_states": list(PHASE6_PUBLISH_STATES),
         "claim_creation": "atomic_exclusive_create",
         "default_existing_claim_policy": "fail_closed",
         "recovery_allowed": False,
+        "publish_recovery_allowed": True,
+        "publish_strategy": "single_atomic_directory_rename_same_filesystem",
         "cross_session_enforcement": "execution_receipt_and_research_procedure",
     }:
         raise ValueError("Phase 6 run-registry contract changed")
@@ -1199,13 +1276,6 @@ def verify_final_test_gate(
     destination = Path(output_dir)
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite Phase 6 output: {destination}")
-    sibling_outputs = (
-        destination.parent / f"{destination.name}.zip",
-        destination.parent / f"{destination.name}.sha256.json",
-        destination.parent / f"{destination.name}.zip.tmp",
-    )
-    if any(path.exists() for path in sibling_outputs):
-        raise FileExistsError("refusing to overwrite a Phase 6 bundle, receipt, or temporary ZIP")
     if kaggle:
         output_posix = PurePosixPath(str(destination).replace("\\", "/"))
         try:
@@ -1373,7 +1443,7 @@ def verify_final_test_gate(
         **gate_identity,
         "explicit_allow_final_test": True,
         "output_path_was_absent": True,
-        "output_sibling_bundle_paths_were_absent": True,
+        "published_bundle_destination_was_absent_at_claim": True,
         "runner_git_sha": runner_git_sha,
         "validation_code_git_sha_is_ancestor": True,
         "git_dirty_state_policy": "tracked_and_untracked_files",
@@ -1442,6 +1512,7 @@ def verify_final_test_gate(
     )
     if _gate_identity(gate) != gate_identity:
         raise AssertionError("internal Phase 6 gate identity construction mismatch")
+    assert_phase6_state_consistency(registry_claim_path)
     return gate
 
 
@@ -1500,12 +1571,18 @@ def _validate_executable_gate(protocol: Any, gate: FinalTestGate) -> dict[str, A
     if gate.execution_id != expected_execution_id:
         raise TestEvaluationBlockedError("gate deterministic execution_id is invalid")
     registry = _read_registry_claim(gate.registry_claim_path)
-    if registry.get("state") != "claimed":
+    if (
+        registry.get("scientific_state") != "claimed"
+        or registry.get("publish_state") != "not_started"
+    ):
         raise TestEvaluationBlockedError(
-            f"Phase 6 execution claim is not fresh: state={registry.get('state')}"
+            "Phase 6 execution claim is not fresh: "
+            f"scientific_state={registry.get('scientific_state')}, "
+            f"publish_state={registry.get('publish_state')}"
         )
     if registry.get("gate_identity") != _gate_identity(gate):
         raise TestEvaluationBlockedError("registry claim does not match executable gate")
+    assert_phase6_state_consistency(gate.registry_claim_path)
     return registry
 
 
@@ -1714,46 +1791,41 @@ def _verify_prediction_alignment(
 def _stage_final_bundle(
     output_dir: Path,
     *,
+    claim_path: Path,
     execution_id: str,
     success_manifest: Mapping[str, Any],
 ) -> StagedFinalBundle:
-    public_manifest = output_dir / "phase6_test_manifest.json"
-    public_zip = output_dir.parent / f"{output_dir.name}.zip"
-    public_receipt = output_dir.parent / f"{output_dir.name}.sha256.json"
-    if any(path.exists() for path in (public_manifest, public_zip, public_receipt)):
-        raise FileExistsError("refusing to overwrite a public Phase 6 final artifact")
-
-    staging_root = (
-        output_dir.parent / ".cell_msca_phase6_staging" / execution_id
-    )
-    if staging_root.exists():
-        raise FileExistsError(f"refusing to overwrite Phase 6 staging: {staging_root}")
-    staging_root.mkdir(parents=True, exist_ok=False)
-    staged_manifest = staging_root / "phase6_test_manifest.json.staged"
-    staged_zip = staging_root / f"{output_dir.name}.zip.staged"
-    staged_receipt = staging_root / f"{output_dir.name}.sha256.json.staged"
-    _atomic_write_json(staged_manifest, success_manifest)
-    with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(output_dir.rglob("*")):
-            if path.is_file() and path.name != "phase6_failure_manifest.json":
-                archive.write(path, path.relative_to(output_dir).as_posix())
-        archive.write(staged_manifest, "phase6_test_manifest.json")
-    zip_sha256 = file_sha256(staged_zip)
-    _atomic_write_json(
-        staged_receipt,
-        {
-            "artifact_classification": "final-test",
-            "execution_id": execution_id,
-            "file_name": public_zip.name,
-            "size_bytes": staged_zip.stat().st_size,
-            "sha256": zip_sha256,
-        },
-    )
+    registry = _read_registry_claim(claim_path)
+    if (
+        registry.get("execution_id") != execution_id
+        or registry.get("scientific_state") != "completed"
+        or registry.get("publish_state") != "staging"
+    ):
+        raise TestEvaluationBlockedError(
+            "staging requires the exact completed scientific execution"
+        )
+    bundle_dir = Path(str(registry["staging_bundle_dir"])).resolve()
+    public_bundle_dir = Path(str(registry["public_bundle_dir"])).resolve()
+    if bundle_dir.exists():
+        raise FileExistsError(f"refusing to overwrite Phase 6 staging: {bundle_dir}")
+    if public_bundle_dir.exists():
+        raise FileExistsError(
+            f"refusing to overwrite published Phase 6 bundle: {public_bundle_dir}"
+        )
+    bundle_dir.mkdir(parents=True, exist_ok=False)
+    public_bundle_dir.parent.mkdir(parents=True, exist_ok=True)
+    staged_manifest = bundle_dir / "phase6_test_manifest.json"
+    staged_zip = bundle_dir / f"cell-msca-phase6-final-test-{execution_id}.zip"
+    staged_receipt = bundle_dir / "final_test_zip_receipt.json"
+    _write_staging_manifest(staged_manifest, success_manifest)
+    _write_staging_zip(staged_zip, output_dir, staged_manifest)
+    _write_staging_receipt(staged_receipt, staged_zip, execution_id)
+    zip_sha256 = _bundle_file_sha256(staged_zip)
     hashes = MappingProxyType(
         {
-            "success_manifest": file_sha256(staged_manifest),
+            "success_manifest": _bundle_file_sha256(staged_manifest),
             "zip": zip_sha256,
-            "receipt": file_sha256(staged_receipt),
+            "receipt": _bundle_file_sha256(staged_receipt),
         }
     )
     for name, path in {
@@ -1761,132 +1833,417 @@ def _stage_final_bundle(
         "zip": staged_zip,
         "receipt": staged_receipt,
     }.items():
-        if file_sha256(path) != hashes[name]:
+        if _bundle_file_sha256(path) != hashes[name]:
             raise ValueError(f"staged Phase 6 {name} SHA-256 verification failed")
     return StagedFinalBundle(
-        staging_root=staging_root,
+        bundle_dir=bundle_dir,
+        public_bundle_dir=public_bundle_dir,
         success_manifest=staged_manifest,
         zip_path=staged_zip,
         receipt_path=staged_receipt,
-        public_success_manifest=public_manifest,
-        public_zip_path=public_zip,
-        public_receipt_path=public_receipt,
         sha256_by_name=hashes,
     )
 
 
+def _write_staging_manifest(path: Path, values: Mapping[str, Any]) -> None:
+    _atomic_write_json(_bundle_io_path(path), values)
+
+
+def _write_staging_zip(zip_path: Path, output_dir: Path, manifest_path: Path) -> None:
+    with zipfile.ZipFile(
+        _bundle_io_path(zip_path), "x", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if path.is_file() and path.name != "phase6_failure_manifest.json":
+                archive.write(path, path.relative_to(output_dir).as_posix())
+        archive.write(_bundle_io_path(manifest_path), "phase6_test_manifest.json")
+
+
+def _write_staging_receipt(
+    receipt_path: Path,
+    zip_path: Path,
+    execution_id: str,
+) -> None:
+    _atomic_write_json(
+        _bundle_io_path(receipt_path),
+        {
+            "artifact_classification": "final-test",
+            "execution_id": execution_id,
+            "file_name": zip_path.name,
+            "size_bytes": _bundle_io_path(zip_path).stat().st_size,
+            "sha256": _bundle_file_sha256(zip_path),
+        },
+    )
+
+
+def _bundle_io_path(path: Path) -> Path:
+    resolved = path.resolve()
+    if os.name == "nt" and not str(resolved).startswith("\\\\?\\"):
+        return Path(f"\\\\?\\{resolved}")
+    return resolved
+
+
+def _bundle_file_sha256(path: Path) -> str:
+    return file_sha256(_bundle_io_path(path))
+
+
+def _bundle_artifact_sha256_snapshot(bundle_dir: Path) -> dict[str, str]:
+    """Record every currently present regular file without treating it as valid."""
+
+    if not bundle_dir.is_dir():
+        return {}
+    return {
+        path.name: _bundle_file_sha256(path)
+        for path in sorted(bundle_dir.iterdir(), key=lambda item: item.name)
+        if _bundle_io_path(path).is_file()
+    }
+
+
 def _staged_bundle_record(bundle: StagedFinalBundle) -> dict[str, Any]:
     return {
-        "staging_root": str(bundle.staging_root.resolve()),
+        "bundle_dir": str(bundle.bundle_dir.resolve()),
+        "public_bundle_dir": str(bundle.public_bundle_dir.resolve()),
         "artifacts": {
             "success_manifest": {
-                "staged_path": str(bundle.success_manifest.resolve()),
-                "public_path": str(bundle.public_success_manifest.resolve()),
+                "file_name": bundle.success_manifest.name,
                 "sha256": bundle.sha256_by_name["success_manifest"],
             },
             "zip": {
-                "staged_path": str(bundle.zip_path.resolve()),
-                "public_path": str(bundle.public_zip_path.resolve()),
+                "file_name": bundle.zip_path.name,
                 "sha256": bundle.sha256_by_name["zip"],
             },
             "receipt": {
-                "staged_path": str(bundle.receipt_path.resolve()),
-                "public_path": str(bundle.public_receipt_path.resolve()),
+                "file_name": bundle.receipt_path.name,
                 "sha256": bundle.sha256_by_name["receipt"],
             },
         },
     }
 
 
-def _publish_one_staged_artifact(staged: Path, public: Path) -> None:
-    public.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staged, public)
+def _validate_final_bundle_read_only(
+    bundle_dir: Path,
+    registry: Mapping[str, Any],
+    *,
+    require_public_destination_absent: bool,
+) -> dict[str, Any]:
+    execution_id = str(registry.get("execution_id", ""))
+    if registry.get("scientific_state") != "completed":
+        raise TestEvaluationBlockedError(
+            "a final bundle is valid only for completed scientific execution"
+        )
+    expected_names = {
+        "phase6_test_manifest.json",
+        f"cell-msca-phase6-final-test-{execution_id}.zip",
+        "final_test_zip_receipt.json",
+    }
+    if not bundle_dir.is_dir():
+        raise TestEvaluationBlockedError("Phase 6 bundle directory is missing")
+    actual_names = {path.name for path in bundle_dir.iterdir()}
+    if actual_names != expected_names:
+        raise TestEvaluationBlockedError(
+            "Phase 6 bundle must contain exactly the three frozen final artifacts"
+        )
+    if not all(_bundle_io_path(bundle_dir / name).is_file() for name in expected_names):
+        raise TestEvaluationBlockedError("Phase 6 bundle contains a non-file artifact")
+
+    manifest_path = bundle_dir / "phase6_test_manifest.json"
+    zip_path = bundle_dir / f"cell-msca-phase6-final-test-{execution_id}.zip"
+    receipt_path = bundle_dir / "final_test_zip_receipt.json"
+    manifest = _read_json(_bundle_io_path(manifest_path))
+    receipt = _read_json(_bundle_io_path(receipt_path))
+    gate_identity = registry.get("gate_identity")
+    if not isinstance(gate_identity, Mapping):
+        raise TestEvaluationBlockedError("registry gate identity is missing")
+    expected_manifest = {
+        "execution_id": execution_id,
+        "protocol_config_sha256": gate_identity["protocol_config_sha256"],
+        "protocol_config_canonical_sha256": gate_identity[
+            "protocol_config_canonical_sha256"
+        ],
+        "protocol_fingerprint": gate_identity["protocol_fingerprint"],
+        "phase5a_package_sha256": gate_identity["phase5a_package_sha256"],
+        "seed42_package_sha256": gate_identity["seed42_package_sha256"],
+        "data_sha256": gate_identity["data_sha256"],
+        "split_sha256": gate_identity["split_sha256"],
+        "split_config_sha256": gate_identity["split_config_sha256"],
+        "preprocessing_sha256": gate_identity["preprocessing_sha256"],
+        "runner_git_sha": gate_identity["source_git_sha"],
+    }
+    for name, expected in expected_manifest.items():
+        if manifest.get(name) != expected:
+            raise TestEvaluationBlockedError(
+                f"Phase 6 success manifest {name} differs from registry"
+            )
+    required_flags = {
+        "test_subset_materialized": True,
+        "test_evaluation_performed": True,
+        "training_performed": False,
+        "model_selection_performed": False,
+    }
+    for name, expected in required_flags.items():
+        if manifest.get(name) is not expected:
+            raise TestEvaluationBlockedError(
+                f"Phase 6 success manifest has invalid {name}"
+            )
+    run_artifacts = manifest.get("run_artifacts")
+    if not isinstance(run_artifacts, list):
+        raise TestEvaluationBlockedError("Phase 6 success manifest run artifacts are missing")
+    manifest_keys = {
+        (str(row.get("model_name")), int(row.get("train_seed")))
+        for row in run_artifacts
+        if isinstance(row, Mapping)
+    }
+    registry_keys = {
+        (str(row["model_name"]), int(row["train_seed"]))
+        for row in gate_identity["evaluation_keys"]
+    }
+    if len(run_artifacts) != len(registry_keys) or manifest_keys != registry_keys:
+        raise TestEvaluationBlockedError(
+            "Phase 6 success manifest model/seed set differs from registry"
+        )
+
+    zip_sha256 = _bundle_file_sha256(zip_path)
+    expected_receipt = {
+        "artifact_classification": "final-test",
+        "execution_id": execution_id,
+        "file_name": zip_path.name,
+        "size_bytes": _bundle_io_path(zip_path).stat().st_size,
+        "sha256": zip_sha256,
+    }
+    if receipt != expected_receipt:
+        raise TestEvaluationBlockedError("Phase 6 final ZIP receipt is invalid")
+    try:
+        with zipfile.ZipFile(_bundle_io_path(zip_path), "r") as archive:
+            if archive.testzip() is not None:
+                raise TestEvaluationBlockedError("Phase 6 final ZIP member is corrupt")
+            if archive.namelist().count("phase6_test_manifest.json") != 1:
+                raise TestEvaluationBlockedError(
+                    "Phase 6 final ZIP must contain one success manifest"
+                )
+            if archive.read("phase6_test_manifest.json") != _bundle_io_path(
+                manifest_path
+            ).read_bytes():
+                raise TestEvaluationBlockedError(
+                    "Phase 6 final ZIP manifest differs from standalone manifest"
+                )
+    except zipfile.BadZipFile as error:
+        raise TestEvaluationBlockedError("Phase 6 final ZIP is invalid") from error
+
+    staged_record = registry.get("staging_bundle")
+    if isinstance(staged_record, Mapping):
+        artifacts = staged_record.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            raise TestEvaluationBlockedError("registry staging artifact record is invalid")
+        paths = {
+            "success_manifest": manifest_path,
+            "zip": zip_path,
+            "receipt": receipt_path,
+        }
+        for name, path in paths.items():
+            row = artifacts.get(name)
+            if not isinstance(row, Mapping):
+                raise TestEvaluationBlockedError("registry staging artifact row is missing")
+            if (
+                row.get("file_name") != path.name
+                or row.get("sha256") != _bundle_file_sha256(path)
+            ):
+                raise TestEvaluationBlockedError(
+                    f"Phase 6 {name} differs from its staged registry SHA-256"
+                )
+
+    public_bundle_dir = Path(str(registry["public_bundle_dir"])).resolve()
+    if require_public_destination_absent:
+        if public_bundle_dir.exists():
+            raise FileExistsError(
+                f"published Phase 6 destination already exists: {public_bundle_dir}"
+            )
+        public_bundle_dir.parent.mkdir(parents=True, exist_ok=True)
+        if bundle_dir.stat().st_dev != public_bundle_dir.parent.stat().st_dev:
+            raise TestEvaluationBlockedError(
+                "Phase 6 staging and public destination must share one filesystem"
+            )
+    return {
+        "bundle_dir": str(bundle_dir.resolve()),
+        "artifacts": {
+            "success_manifest": {
+                "path": str(manifest_path.resolve()),
+                "sha256": _bundle_file_sha256(manifest_path),
+            },
+            "zip": {"path": str(zip_path.resolve()), "sha256": zip_sha256},
+            "receipt": {
+                "path": str(receipt_path.resolve()),
+                "sha256": _bundle_file_sha256(receipt_path),
+            },
+        },
+    }
+
+
+def _atomic_publish_bundle(staged_bundle_dir: Path, public_bundle_dir: Path) -> None:
+    if public_bundle_dir.exists():
+        raise FileExistsError(
+            f"published Phase 6 destination already exists: {public_bundle_dir}"
+        )
+    if staged_bundle_dir.stat().st_dev != public_bundle_dir.parent.stat().st_dev:
+        raise TestEvaluationBlockedError(
+            "Phase 6 atomic publish requires one filesystem"
+        )
+    os.replace(
+        _bundle_io_path(staged_bundle_dir),
+        _bundle_io_path(public_bundle_dir),
+    )
+
+
+def assert_phase6_state_consistency(claim_path: str | Path) -> dict[str, Any]:
+    registry = _read_registry_claim(Path(claim_path))
+    scientific_state = str(registry["scientific_state"])
+    publish_state = str(registry["publish_state"])
+    staging = Path(str(registry["staging_bundle_dir"])).resolve()
+    public = Path(str(registry["public_bundle_dir"])).resolve()
+    output = Path(str(registry["output_dir"])).resolve()
+    staging_exists = staging.exists()
+    public_exists = public.exists()
+    if staging_exists and public_exists:
+        raise TestEvaluationBlockedError(
+            "Phase 6 staging and public bundles cannot coexist"
+        )
+    if scientific_state != "completed" and publish_state != "not_started":
+        raise TestEvaluationBlockedError(
+            "publish state advanced before scientific completion"
+        )
+    if scientific_state == "failed" and public_exists:
+        raise TestEvaluationBlockedError(
+            "failed scientific execution cannot have a public completed bundle"
+        )
+    if publish_state in {"not_started", "staging", "ready"} and public_exists:
+        raise TestEvaluationBlockedError(
+            f"public bundle is forbidden while publish_state={publish_state}"
+        )
+    if publish_state == "not_started" and staging_exists:
+        raise TestEvaluationBlockedError(
+            "staging bundle exists before publication started"
+        )
+    if publish_state == "ready":
+        if not staging_exists:
+            raise TestEvaluationBlockedError("ready publish state has no staging bundle")
+        _validate_final_bundle_read_only(
+            staging,
+            registry,
+            require_public_destination_absent=True,
+        )
+    if publish_state == "publishing":
+        if staging_exists == public_exists:
+            raise TestEvaluationBlockedError(
+                "publishing state must have exactly one complete bundle location"
+            )
+    if public_exists:
+        _validate_final_bundle_read_only(
+            public,
+            registry,
+            require_public_destination_absent=False,
+        )
+    if publish_state == "published":
+        if scientific_state != "completed" or not public_exists or staging_exists:
+            raise TestEvaluationBlockedError("published Phase 6 state is inconsistent")
+        publish_error = registry.get("publish_error")
+        if isinstance(publish_error, Mapping) and publish_error.get("status") != "resolved":
+            raise TestEvaluationBlockedError("published state has unresolved publish error")
+    failure_manifest = output / "phase6_failure_manifest.json"
+    if scientific_state == "completed" and failure_manifest.exists():
+        raise TestEvaluationBlockedError(
+            "completed scientific execution cannot retain a failure manifest"
+        )
+    return {
+        "scientific_state": scientific_state,
+        "publish_state": publish_state,
+        "staging_bundle_exists": staging_exists,
+        "public_bundle_exists": public_exists,
+        "partial_public_bundle": False,
+    }
+
+
+def _record_publish_failure(
+    claim_path: Path,
+    *,
+    execution_id: str,
+    error: Exception,
+) -> dict[str, Any]:
+    registry = _read_registry_claim(claim_path)
+    if registry.get("scientific_state") != "completed":
+        raise TestEvaluationBlockedError(
+            "publish failure cannot replace scientific execution state"
+        )
+    staging_bundle_dir = Path(str(registry["staging_bundle_dir"])).resolve()
+    public_bundle_dir = Path(str(registry["public_bundle_dir"])).resolve()
+    updates = {
+        "publish_recovery_allowed": True,
+        "publish_error": {
+            "status": "unresolved",
+            "type": type(error).__name__,
+            "message": str(error),
+            "failed_at_utc": _utc_now(),
+            "staging_bundle_exists": staging_bundle_dir.exists(),
+            "public_bundle_exists": public_bundle_dir.exists(),
+            "staging_artifact_sha256": _bundle_artifact_sha256_snapshot(
+                staging_bundle_dir
+            ),
+            "public_artifact_sha256": _bundle_artifact_sha256_snapshot(
+                public_bundle_dir
+            ),
+            "staging_bundle": registry.get("staging_bundle"),
+        },
+    }
+    if registry.get("publish_state") == "publish_failed":
+        return _update_completed_registry(
+            claim_path,
+            execution_id=execution_id,
+            updates=updates,
+        )
+    return _transition_publish_registry(
+        claim_path,
+        None,
+        execution_id=execution_id,
+        state="publish_failed",
+        updates=updates,
+    )
 
 
 def _publish_completed_staging(
     claim_path: Path,
-    *,
-    execution_id: str,
-    recovery: bool,
+    gate: FinalTestGate,
 ) -> dict[str, Any]:
     registry = _read_registry_claim(claim_path)
-    if registry.get("state") != "completed" or registry.get("execution_id") != execution_id:
-        raise TestEvaluationBlockedError(
-            "public Phase 6 publish requires the exact completed registry"
-        )
-    staging = registry.get("staging_bundle")
-    if not isinstance(staging, Mapping) or not isinstance(
-        staging.get("artifacts"), Mapping
+    if (
+        registry.get("scientific_state") != "completed"
+        or registry.get("publish_state") != "ready"
     ):
-        raise TestEvaluationBlockedError("completed registry has no verified staging bundle")
-    artifacts = staging["artifacts"]
-    if set(artifacts) != {"success_manifest", "zip", "receipt"}:
-        raise TestEvaluationBlockedError("completed staging artifact set is invalid")
-    output_dir = Path(str(registry.get("output_dir", ""))).resolve()
-    expected_public_paths = {
-        "success_manifest": (output_dir / "phase6_test_manifest.json").resolve(),
-        "zip": (output_dir.parent / f"{output_dir.name}.zip").resolve(),
-        "receipt": (
-            output_dir.parent / f"{output_dir.name}.sha256.json"
-        ).resolve(),
-    }
-    expected_staging_root = (
-        output_dir.parent / ".cell_msca_phase6_staging" / execution_id
-    ).resolve()
-    if Path(str(staging.get("staging_root", ""))).resolve() != expected_staging_root:
         raise TestEvaluationBlockedError(
-            "completed staging root differs from the claimed execution output"
+            "atomic publish requires completed science and a ready bundle"
         )
-    published: dict[str, dict[str, str]] = {}
-    for name in ("success_manifest", "zip", "receipt"):
-        row = artifacts[name]
-        if not isinstance(row, Mapping):
-            raise TestEvaluationBlockedError("completed staging artifact row is invalid")
-        staged = Path(str(row["staged_path"]))
-        public = Path(str(row["public_path"]))
-        if public.resolve() != expected_public_paths[name]:
-            raise TestEvaluationBlockedError(
-                f"completed Phase 6 {name} public path differs from its claim"
-            )
-        try:
-            staged.resolve().relative_to(expected_staging_root)
-        except ValueError as error:
-            raise TestEvaluationBlockedError(
-                f"completed Phase 6 {name} staging path escapes its staging root"
-            ) from error
-        expected = _validate_sha256(row["sha256"], name=f"staging.{name}.sha256")
-        if public.exists():
-            if file_sha256(public) != expected:
-                raise TestEvaluationBlockedError(
-                    f"published Phase 6 {name} differs from completed staging SHA-256"
-                )
-        else:
-            if not staged.is_file() or file_sha256(staged) != expected:
-                raise TestEvaluationBlockedError(
-                    f"staged Phase 6 {name} is missing or was modified"
-                )
-            _publish_one_staged_artifact(staged, public)
-            if file_sha256(public) != expected:
-                raise TestEvaluationBlockedError(
-                    f"published Phase 6 {name} failed SHA-256 verification"
-                )
-        published[name] = {"path": str(public.resolve()), "sha256": expected}
-    recovery_count = int(registry.get("publish_recovery_count", 0)) + int(recovery)
-    recovery_attempt_count = int(
-        registry.get("publish_recovery_attempt_count", 0)
-    ) + int(recovery)
-    _update_completed_registry(
+    staged = Path(str(registry["staging_bundle_dir"])).resolve()
+    public = Path(str(registry["public_bundle_dir"])).resolve()
+    _validate_final_bundle_read_only(
+        staged,
+        registry,
+        require_public_destination_absent=True,
+    )
+    _transition_publish_registry(claim_path, gate, state="publishing")
+    _atomic_publish_bundle(staged, public)
+    published = _validate_final_bundle_read_only(
+        public,
+        _read_registry_claim(claim_path),
+        require_public_destination_absent=False,
+    )
+    _transition_publish_registry(
         claim_path,
-        execution_id=execution_id,
+        gate,
+        state="published",
         updates={
-            "publish_status": "published",
-            "published_artifacts": published,
-            "publish_recovery_count": recovery_count,
-            "publish_recovery_attempt_count": recovery_attempt_count,
-            "publish_recovery_status": "published" if recovery else "not_requested",
+            "published_bundle": published,
+            "publish_recovery_allowed": False,
             "published_at_utc": _utc_now(),
         },
     )
+    assert_phase6_state_consistency(claim_path)
     return published
 
 
@@ -1905,33 +2262,86 @@ def recover_completed_final_publish(
     )
     claim_path = registry_root / f"{execution_id}.json"
     try:
-        return _publish_completed_staging(
-            claim_path,
-            execution_id=execution_id,
-            recovery=True,
-        )
-    except Exception as error:
         registry = _read_registry_claim(claim_path)
-        if (
-            registry.get("state") == "completed"
-            and registry.get("execution_id") == execution_id
-        ):
-            _update_completed_registry(
-                claim_path,
-                execution_id=execution_id,
-                updates={
-                    "publish_recovery_attempt_count": int(
-                        registry.get("publish_recovery_attempt_count", 0)
-                    )
-                    + 1,
-                    "publish_recovery_status": "failed",
-                    "publish_recovery_failed_at_utc": _utc_now(),
-                    "publish_recovery_exception": {
-                        "type": type(error).__name__,
-                        "message": str(error),
-                    },
-                },
+        if registry.get("scientific_state") != "completed":
+            raise TestEvaluationBlockedError(
+                "publish recovery requires completed scientific execution"
             )
+        if registry.get("publish_state") not in {"publishing", "publish_failed"}:
+            raise TestEvaluationBlockedError(
+                "publish recovery requires publishing or publish_failed state"
+            )
+        staged = Path(str(registry["staging_bundle_dir"])).resolve()
+        public = Path(str(registry["public_bundle_dir"])).resolve()
+        if public.exists():
+            if staged.exists():
+                raise TestEvaluationBlockedError(
+                    "publish recovery found both staging and public bundles"
+                )
+            published = _validate_final_bundle_read_only(
+                public,
+                registry,
+                require_public_destination_absent=False,
+            )
+        else:
+            _validate_final_bundle_read_only(
+                staged,
+                registry,
+                require_public_destination_absent=True,
+            )
+            if registry.get("publish_state") != "publishing":
+                _transition_publish_registry(
+                    claim_path,
+                    None,
+                    execution_id=execution_id,
+                    state="publishing",
+                )
+            _atomic_publish_bundle(staged, public)
+            published = _validate_final_bundle_read_only(
+                public,
+                _read_registry_claim(claim_path),
+                require_public_destination_absent=False,
+            )
+        current = _read_registry_claim(claim_path)
+        error_record = current.get("publish_error")
+        resolved_error = (
+            {**dict(error_record), "status": "resolved", "resolved_at_utc": _utc_now()}
+            if isinstance(error_record, Mapping)
+            else {"status": "resolved", "resolved_at_utc": _utc_now()}
+        )
+        _transition_publish_registry(
+            claim_path,
+            None,
+            execution_id=execution_id,
+            state="published",
+            updates={
+                "published_bundle": published,
+                "publish_recovery_allowed": False,
+                "publish_recovery_count": int(
+                    current.get("publish_recovery_count", 0)
+                )
+                + 1,
+                "publish_error": resolved_error,
+                "published_at_utc": _utc_now(),
+            },
+        )
+        assert_phase6_state_consistency(claim_path)
+        return published
+    except Exception as error:
+        try:
+            registry = _read_registry_claim(claim_path)
+            if (
+                registry.get("scientific_state") == "completed"
+                and registry.get("execution_id") == execution_id
+            ):
+                _record_publish_failure(
+                    claim_path,
+                    execution_id=execution_id,
+                    error=error,
+                )
+                assert_phase6_state_consistency(claim_path)
+        except Exception:
+            pass
         raise
 
 
@@ -2208,6 +2618,8 @@ def execute_locked_final_test(
             "protocol_config_sha256": gate.config_sha256,
             "protocol_config_canonical_sha256": gate.config_canonical_sha256,
             "protocol_fingerprint": gate.protocol_fingerprint,
+            "phase5a_package_sha256": gate.phase5a_package_sha256,
+            "seed42_package_sha256": gate.seed42_package_sha256,
             "validation_code_git_sha": gate.config["validation_code_git_sha"],
             "runner_git_sha": gate.source_git_sha,
             "data_sha256": protocol.provenance.data_sha256,
@@ -2236,22 +2648,6 @@ def execute_locked_final_test(
         }
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(f"{_utc_now()} aggregation_and_bootstrap_completed\n")
-        staged = _stage_final_bundle(
-            destination,
-            execution_id=gate.execution_id,
-            success_manifest=manifest,
-        )
-        staging_record = _staged_bundle_record(staged)
-        _transition_registry(
-            gate.registry_claim_path,
-            gate,
-            state="finalizing",
-            updates={
-                "staging_bundle": staging_record,
-                "staging_sha256_verified": True,
-                "publish_status": "not_started",
-            },
-        )
         _transition_registry(
             gate.registry_claim_path,
             gate,
@@ -2261,21 +2657,56 @@ def execute_locked_final_test(
                 "test_evaluation_performed": True,
                 "completed_model_seeds": completed_keys,
                 "completed_artifacts": completed_artifacts,
+                "scientific_success_manifest": manifest,
+            },
+        )
+        _transition_publish_registry(
+            gate.registry_claim_path,
+            gate,
+            state="staging",
+            updates={"publish_recovery_allowed": True},
+        )
+        staged = _stage_final_bundle(
+            destination,
+            claim_path=gate.registry_claim_path,
+            execution_id=gate.execution_id,
+            success_manifest=manifest,
+        )
+        staging_record = _staged_bundle_record(staged)
+        _update_completed_registry(
+            gate.registry_claim_path,
+            execution_id=gate.execution_id,
+            updates={
                 "staging_bundle": staging_record,
-                "staging_sha256_verified": True,
-                "publish_status": "pending",
+                "staging_validation_status": "pending",
+            },
+        )
+        validation = _validate_final_bundle_read_only(
+            staged.bundle_dir,
+            _read_registry_claim(gate.registry_claim_path),
+            require_public_destination_absent=True,
+        )
+        _transition_publish_registry(
+            gate.registry_claim_path,
+            gate,
+            state="ready",
+            updates={
+                "staging_bundle": staging_record,
+                "staging_validation": validation,
+                "staging_validation_status": "passed",
+                "staging_read_only_validation_passed": True,
             },
         )
         published = _publish_completed_staging(
             gate.registry_claim_path,
-            execution_id=gate.execution_id,
-            recovery=False,
+            gate,
         )
         return {
             "output_dir": str(destination),
-            "final_zip": published["zip"]["path"],
-            "final_zip_sha256_receipt": published["receipt"]["path"],
-            "final_zip_sha256": published["zip"]["sha256"],
+            "published_bundle_dir": published["bundle_dir"],
+            "final_zip": published["artifacts"]["zip"]["path"],
+            "final_zip_sha256_receipt": published["artifacts"]["receipt"]["path"],
+            "final_zip_sha256": published["artifacts"]["zip"]["sha256"],
             "execution_id": gate.execution_id,
             "manifest": manifest,
         }
@@ -2301,26 +2732,38 @@ def execute_locked_final_test(
         }
         try:
             registry = _read_registry_claim(gate.registry_claim_path)
-            if registry["state"] == "completed":
-                _update_completed_registry(
+            if registry["scientific_state"] == "completed":
+                _record_publish_failure(
                     gate.registry_claim_path,
                     execution_id=gate.execution_id,
-                    updates={
-                        "publish_status": "failed",
-                        "publish_exception_type": type(error).__name__,
-                        "publish_exception_message": str(error),
-                        "publish_failed_at_utc": _utc_now(),
-                    },
+                    error=error,
                 )
-            elif registry["state"] != "failed":
+                if destination.is_dir():
+                    failure_path = destination / "phase6_failure_manifest.json"
+                    if failure_path.exists():
+                        raise TestEvaluationBlockedError(
+                            "publish failure cannot coexist with scientific failure manifest"
+                        )
+            elif registry["scientific_state"] != "failed":
                 _transition_registry(
                     gate.registry_claim_path,
                     gate,
                     state="failed",
                     updates=failure,
                 )
-        finally:
-            if destination.is_dir():
+                if destination.is_dir():
+                    _atomic_write_json(
+                        destination / "phase6_failure_manifest.json", failure
+                    )
+            assert_phase6_state_consistency(gate.registry_claim_path)
+        except Exception:
+            if (
+                destination.is_dir()
+                and _read_registry_claim(gate.registry_claim_path)[
+                    "scientific_state"
+                ]
+                != "completed"
+            ):
                 _atomic_write_json(destination / "phase6_failure_manifest.json", failure)
         raise
 
